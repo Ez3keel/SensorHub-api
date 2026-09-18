@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
 using SensorHub.Application.Ingestion;
+using SensorHub.Application.Queries;
 
 namespace SensorHub.Api.Infrastructure;
 
@@ -18,6 +19,12 @@ public sealed class GlobalExceptionHandler(ILogger<GlobalExceptionHandler> logge
             logger.LogWarning(exception, "Ingestão indisponível; devolvendo 503 ao cliente.");
             context.Response.Headers.RetryAfter = "1";
             await Write(context, StatusCodes.Status503ServiceUnavailable, "Serviço temporariamente indisponível", exception.Message, cancellationToken);
+            return true;
+        }
+
+        if (exception is QueryValidationException invalid)
+        {
+            await Write(context, StatusCodes.Status400BadRequest, "Consulta inválida", invalid.Message, cancellationToken);
             return true;
         }
 
