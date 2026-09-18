@@ -1,23 +1,38 @@
+using SensorHub.Api.Infrastructure;
+using SensorHub.Application;
+using SensorHub.Infrastructure;
+using SensorHub.Infrastructure.Kafka;
+
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
-
 builder.Services.AddControllers();
-// Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
+builder.Services.AddProblemDetails();
+builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
+
+builder.Services.AddIngestion(builder.Configuration);
+builder.Services.AddKafkaMessaging(builder.Configuration);
+builder.Services.AddKafkaReadingPublisher();
+
+builder.Services.AddHealthChecks()
+    .AddCheck<KafkaHealthCheck>("kafka", tags: ["ready"]);
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
+app.UseExceptionHandler();
+
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
 }
 
-app.UseHttpsRedirection();
-
-app.UseAuthorization();
-
 app.MapControllers();
 
+// liveness: o processo está de pé. readiness: as dependências respondem.
+app.MapHealthChecks("/health/live", new() { Predicate = _ => false });
+app.MapHealthChecks("/health/ready", new() { Predicate = check => check.Tags.Contains("ready") });
+
 app.Run();
+
+// Necessário para WebApplicationFactory<Program> nos testes de integração.
+public partial class Program;
