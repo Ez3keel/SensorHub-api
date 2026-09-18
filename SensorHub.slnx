@@ -1,0 +1,17 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SensorHub.Api/SensorHub.Api.csproj" />
+    <Project Path="src/SensorHub.Application/SensorHub.Application.csproj" />
+    <Project Path="src/SensorHub.Domain/SensorHub.Domain.csproj" />
+    <Project Path="src/SensorHub.Infrastructure/SensorHub.Infrastructure.csproj" />
+    <Project Path="src/SensorHub.Worker/SensorHub.Worker.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SensorHub.Application.Tests/SensorHub.Application.Tests.csproj" />
+    <Project Path="tests/SensorHub.Domain.Tests/SensorHub.Domain.Tests.csproj" />
+    <Project Path="tests/SensorHub.IntegrationTests/SensorHub.IntegrationTests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/SensorHub.Simulator/SensorHub.Simulator.csproj" />
+  </Folder>
+</Solution>
