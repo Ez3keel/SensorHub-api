@@ -29,7 +29,7 @@ Três *consumer groups* independentes leem o mesmo tópico: é o que o Kafka faz
 |---|---|---|
 | 0 | Domínio + simulador de sensores | ✅ |
 | 1 | Ingestão HTTP → Kafka | ✅ |
-| 2 | Consumer com batching + persistência | ⏳ |
+| 2 | Consumer com batching + persistência | ✅ |
 | 3 | TimescaleDB: agregações e retenção | ⏳ |
 | 4 | Redis: último valor e janelas | ⏳ |
 | 5 | Alertas em stream | ⏳ |
@@ -38,6 +38,15 @@ Três *consumer groups* independentes leem o mesmo tópico: é o que o Kafka faz
 | 8 | Segurança e API de administração | ⏳ |
 | 9 | Compose completo + prova de carga | ⏳ |
 | 10 | MQTT (bridge → Kafka) | ⏳ |
+
+## Executando localmente
+
+```bash
+docker compose up -d kafka timescaledb          # infraestrutura
+dotnet run --project src/SensorHub.Api           # API de ingestão (http://localhost:5080)
+dotnet run --project src/SensorHub.Worker        # consumer de persistência
+dotnet run --project tools/SensorHub.Simulator -c Release -- --mode http --rate 20000 --duration 30
+```
 
 ## Testes
 

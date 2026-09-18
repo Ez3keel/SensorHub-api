@@ -261,3 +261,137 @@ idempotente (`Interlocked.Exchange` numa flag).
 O ambiente já roda a stack do CVAT (Traefik em 8080, Redis, etc.). Por isso o Compose do projeto usa portas
 fora do padrão (Kafka UI em 8090, e nas próximas fases Postgres 5433, Redis 6380, Grafana/Prometheus
 em portas próprias). Não é bug de código, mas um custo real de "rodar tudo local".
+---
+
+## Fase 2: Consumer com batching e persistência
+
+**Objetivo:** tirar o trabalho lento (gravar no banco) do caminho da requisição. Um Worker separado lê o
+Kafka em lotes e grava no PostgreSQL, sem perder nem duplicar leituras, mesmo com falhas, reentregas e picos.
+
+### D2.1: Consumer *pull* sequencial: o backpressure vem de graça, o lag é o amortecedor
+
+A API aceita ~150 mil leituras/s; um escritor Postgres grava dezenas de milhares/s. Essa diferença é
+**esperada** e é exatamente o que o Kafka absorve. Como o consumer *puxa* (só chama `Consume` quando termina o
+lote anterior), um banco lento não enche a memória do Worker: o excesso fica no **log durável do Kafka**, e a
+sua medida é o **lag** (mensagens do log que o grupo ainda não commitou). Nenhum mecanismo de "pause/resume" é
+necessário para o caso normal: basta não puxar mais do que se consegue processar. Testado: com um handler
+artificialmente lento, o lag cresce no Kafka e o consumer ainda termina.
+
+### D2.2: Batching por tamanho **ou** tempo
+
+Um lote fecha quando atinge `MaxBatchSize` (5000) **ou** passa `MaxWaitMs` (250 ms) desde a primeira mensagem.
+O limite de tamanho protege memória e o custo de reprocessar numa falha; o de tempo limita a latência em
+tráfego baixo (sem ele, 3 leituras esperariam para sempre um lote de 5000). Lotes maiores = menos round trips,
+mais latência e mais retrabalho quando um lote falha: é um botão de ajuste, não uma verdade.
+
+### D2.3: Commit manual **depois** do processamento (at-least-once)
+
+`EnableAutoCommit=false`: o offset só é commitado após o handler concluir. Consequência aceita e desenhada:
+se o Worker cair depois de gravar e antes de commitar, o lote é **reentregue**. Por isso o handler é
+idempotente (D2.4). Alternativas descartadas:
+
+- **Commit antes de processar (at-most-once):** uma queda perderia dados silenciosamente. Inaceitável.
+- **Exactly-once do Kafka (transações):** cobre Kafka→Kafka. Aqui o destino é o Postgres, fora da transação do
+  Kafka. O que se consegue na prática é *effectively-once*: at-least-once + escrita idempotente, que é o que
+  fazemos.
+
+### D2.4: Idempotência = chave natural `(sensor_id, ts)` + `ON CONFLICT DO NOTHING`
+
+Duplicatas têm 3 origens: retry do dispositivo após 503, retries internos do producer (cobertos pela
+idempotência do producer) e **reprocessamento do consumer**. Uma única defesa na última camada cobre todas: a PK
+`(sensor_id, ts)` da tabela. O `INSERT` devolve quantas linhas entraram, então `lote - inseridas = duplicatas`
+vira log/métrica. Regra de desempate: **a primeira escrita vence** (testado).
+
+### D2.5: Falha de infraestrutura ≠ falha de dado (classificação)
+
+| Tipo | Exemplo | O que fazer |
+|---|---|---|
+| **Transitória** (infra) | banco fora, timeout, conexão caiu | **Repetir para sempre**, com backoff exponencial + jitter, sem commitar e sem descartar |
+| **Permanente** (dado) | SQLSTATE 22/23 (dado inválido, violação de integridade) | **Isolar** a mensagem culpada e mandá-la à DLQ; o resto do lote segue |
+
+Classificar errado custa caro nos dois sentidos: tratar "banco fora" como "dado ruim" esvaziaria o tópico
+inteiro para a DLQ; tratar "dado ruim" como transitório travaria a partição para sempre. Exceção desconhecida
+é tratada como transitória (o lag alerta um humano; a alternativa silenciosa é pior).
+
+**Durante um retry longo o consumer precisa continuar "vivo".** O broker expulsa do grupo quem não chama
+`Poll` em `max.poll.interval.ms`, provocando rebalance no meio da queda do banco. Solução: **pausar** as
+partições e continuar chamando `Consume` (que devolve vazio) enquanto espera o backoff. Ao voltar, `Resume`.
+
+### D2.6: DLQ e isolamento por bissecção
+
+Uma mensagem "venenosa" (JSON inválido, `sensorId` vazio) **nunca** ficará processável, por mais que se repita.
+Sem DLQ ela bloquearia a partição inteira. Vai para `sensorhub.readings.dlq` com o payload original **byte a
+byte** e headers de contexto (`dlq-reason`, tópico/partição/offset de origem, consumer group). Quando o lote
+inteiro falha por dado e não se sabe qual linha é a culpada, o lote é **dividido ao meio recursivamente**
+(O(log n) rodadas): a metade que passa é gravada, a que falha continua dividindo até sobrar a mensagem única.
+
+### D2.7: Rebalance cooperativo e descarte de partições revogadas
+
+`CooperativeSticky`: ao escalar (entra/sai consumer) só as partições que mudam de dono param; no modo *eager*
+(padrão) o grupo inteiro pararia. Cuidado sutil: mensagens já lidas de uma partição **revogada** enquanto o lote
+era acumulado são descartadas (o novo dono as relê do offset commitado); e o commit nunca inclui partições
+que já não são nossas. Se a partição *volta* para nós, sai do conjunto de revogadas.
+
+### D2.8: Bulk insert: `unnest` vs `COPY` (medido)
+
+Duas estratégias implementadas, ambas idempotentes, comparadas com lotes de 5000 (100 mil linhas cada, 2 rodadas):
+
+| Estratégia | Rodada 1 | Rodada 2 |
+|---|---|---|
+| `COPY` binário para tabela temporária + `INSERT ... ON CONFLICT` | 35.661 linhas/s | 33.138 linhas/s |
+| `INSERT ... SELECT FROM unnest(arrays) ON CONFLICT` | **37.480 linhas/s** | **36.473 linhas/s** |
+
+`unnest` ficou consistentemente ~5–10% à frente e é mais simples (uma instrução, sem criar/dropar tabela
+temporária por lote). Adotado como padrão; `COPY` continua selecionável (`Persistence:Strategy`). A diferença
+é pequena: o gargalo não é o protocolo de transferência, é a **manutenção do índice PK + fsync** (ver Fase 3).
+Os lotes são **ordenados por `(sensor_id, ts)`** antes de gravar: melhora a localidade no índice e evita
+deadlock entre escritores concorrentes com chaves sobrepostas (testado com 6 escritores).
+
+### D2.9: EF Core só para o esquema; o caminho quente é Npgsql cru
+
+O `SensorHubDbContext` existe para **migrations** (e, nas próximas fases, para as entidades relacionais:
+sensores, regras, alertas, usuários). Leituras NÃO passam pelo EF: o change tracker custaria ordens de
+grandeza de vazão em inserts em massa. A tabela `readings` é criada por SQL explícito numa migration.
+O Worker aplica as migrations ao subir (o EF 9+ protege a execução concorrente com advisory lock).
+
+### Resultados medidos
+
+| Cenário | Resultado |
+|---|---|
+| **Backlog real** de 1.947.748 mensagens (sobras dos testes da Fase 1) drenado pelo Worker recém-iniciado | Lag **0** nas 6 partições. 1.943.318 linhas no banco: a diferença de **4.430 são as duplicatas** do 1% que o simulador injetou. Idempotência validada em dado real. |
+| Carga de 20 mil/s por 15 s + **segundo Worker entrando no grupo no meio** (rebalance) | 299.733 enviadas → +299.733 linhas. **Exato.** |
+| Carga de 25 mil/s por 14 s + **`kill -9` do Worker no meio**, reiniciado 4 s depois | 348.801 enviadas → +348.801 linhas. **Diferença = 0.** |
+| Vazão de gravação (1 escritor, Postgres comum em Docker/Windows) | ~35 mil linhas/s no benchmark isolado; ~20 mil/s com API, simulador e banco disputando a mesma CPU |
+
+Sobre o teste de `kill -9`: neste caso o processo caiu **entre** dois commits, então nenhum lote precisou ser
+reprocessado (o log não mostrou "duplicatas ignoradas"). A janela exata "gravou mas não commitou" é coberta de
+forma **determinística** por um teste de integração (`Crash_after_write_but_before_commit_...`), onde o handler
+grava de verdade e falha uma vez antes do commit; o resultado é 2000 linhas, não 4000.
+
+**Achado importante:** a ingestão (~150 mil/s) é 4 a 7 vezes mais rápida que a gravação num Postgres comum
+(~20–35 mil/s). Isso é o amortecedor funcionando (o excesso vira lag e drena depois), mas também aponta o próximo
+gargalo: a Fase 3 (TimescaleDB) e a escala horizontal (até 6 consumers, 1 por partição) atacam isso.
+
+### Bugs encontrados
+
+**1. Descarte de mensagens legítimas após rebalance (perda de dados em potencial). Achado em revisão, antes de rodar.**
+*Sintoma previsto:* após uma partição ser revogada e depois **devolvida ao mesmo consumer**, mensagens válidas
+dela eram descartadas do lote e, como o commit avança pelo offset da última mensagem processada, ficariam para
+trás sem nunca serem relidas. *Causa raiz:* o conjunto `_revoked` só recebia entradas (no handler de revogação)
+e só era limpo quando um lote era filtrado; nada o atualizava quando a partição era atribuída de novo.
+*Correção:* o handler de atribuição remove as partições recebidas do conjunto. Cuidado análogo já existia no
+`Commit`, que ignora partições revogadas durante o processamento.
+
+**2. Conflito de versões do EF Core (`CS1705` / `MSB3277`).**
+*Sintoma:* o projeto de testes não compilava: `Microsoft.EntityFrameworkCore` 10.0.12 (exigido pelo `Design`) vs
+10.0.4 (exigido pelo provider `Npgsql.EntityFrameworkCore.PostgreSQL 10.0.3`). *Causa raiz:* cada projeto do
+grafo resolve as versões transitivas por caminhos diferentes (o `Design` é `PrivateAssets` no Worker e não
+"flui" até os testes), então o projeto de testes acabava com o EF antigo. *Correção:* fixar
+`Microsoft.EntityFrameworkCore` e `.Relational` em 10.0.12 diretamente na Infrastructure.
+
+**3. `taskkill` falhou silenciosamente no Git Bash (erro do experimento, não do código).**
+*Sintoma:* o "kill -9 do Worker" não matou nada e subi um 2º Worker, transformando o teste num teste de
+rebalance acidental. *Causa raiz:* o MSYS do Git Bash reescreve argumentos que começam com `/`
+(`/F` virou caminho). *Correção:* refazer o experimento com `Stop-Process -Force` no PowerShell. Lição:
+verificar que a fonte de falha injetada realmente aconteceu (aqui o rebalance acidental também deu 0 de
+diferença, e o kill real foi repetido e medido).
