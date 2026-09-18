@@ -28,7 +28,7 @@ Três *consumer groups* independentes leem o mesmo tópico: é o que o Kafka faz
 | Fase | Módulo | Status |
 |---|---|---|
 | 0 | Domínio + simulador de sensores | ✅ |
-| 1 | Ingestão HTTP → Kafka | ⏳ |
+| 1 | Ingestão HTTP → Kafka | ✅ |
 | 2 | Consumer com batching + persistência | ⏳ |
 | 3 | TimescaleDB: agregações e retenção | ⏳ |
 | 4 | Redis: último valor e janelas | ⏳ |
