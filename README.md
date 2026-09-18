@@ -30,8 +30,8 @@ Três *consumer groups* independentes leem o mesmo tópico: é o que o Kafka faz
 | 0 | Domínio + simulador de sensores | ✅ |
 | 1 | Ingestão HTTP → Kafka | ✅ |
 | 2 | Consumer com batching + persistência | ✅ |
-| 3 | TimescaleDB: agregações e retenção | ⏳ |
-| 4 | Redis: último valor e janelas | ⏳ |
+| 3 | TimescaleDB: agregações e retenção | ✅ |
+| 4 | Redis: último valor (janelas na Fase 5) | ✅ |
 | 5 | Alertas em stream | ⏳ |
 | 6 | Tempo real (SignalR) + dashboard React | ⏳ |
 | 7 | Observabilidade (OpenTelemetry, lag do consumer) | ⏳ |
@@ -42,7 +42,7 @@ Três *consumer groups* independentes leem o mesmo tópico: é o que o Kafka faz
 ## Executando localmente
 
 ```bash
-docker compose up -d kafka timescaledb          # infraestrutura
+docker compose up -d kafka timescaledb redis   # infraestrutura
 dotnet run --project src/SensorHub.Api           # API de ingestão (http://localhost:5080)
 dotnet run --project src/SensorHub.Worker        # consumer de persistência
 dotnet run --project tools/SensorHub.Simulator -c Release -- --mode http --rate 20000 --duration 30

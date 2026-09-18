@@ -395,3 +395,187 @@ rebalance acidental. *Causa raiz:* o MSYS do Git Bash reescreve argumentos que c
 (`/F` virou caminho). *Correção:* refazer o experimento com `Stop-Process -Force` no PowerShell. Lição:
 verificar que a fonte de falha injetada realmente aconteceu (aqui o rebalance acidental também deu 0 de
 diferença, e o kill real foi repetido e medido).
+
+---
+
+## Fase 3: TimescaleDB, séries temporais e ciclo de vida do dado
+
+**Objetivo:** guardar bilhões de leituras de forma barata, consultá-las por janela de tempo em milissegundos e
+descartar o que envelheceu sem esforço manual.
+
+### D3.1: TimescaleDB vs Postgres puro vs particionamento nativo (medido, com ressalvas honestas)
+
+Mesmo esquema, mesma carga (3.000.000 linhas, 500 sensores, 50 h de dados), mesmas consultas e mesmo caminho de
+escrita (`unnest` + `ON CONFLICT DO NOTHING`), em três variantes: tabela comum, particionamento declarativo
+nativo por hora e hypertable com chunks de 1 h. Mediana de 15 execuções.
+
+| | Postgres puro | Part. nativo (1 h) | TimescaleDB |
+|---|---|---|---|
+| **Ingestão** (linhas/s) | 31.0 mil | 31.2 mil | 31.6 mil |
+| Q1 1 sensor, última hora (bruto) | 1,6 ms | 1,3 ms | 2,0 ms |
+| Q2 1 sensor, 50 h, média/min/max por hora | 11,4 ms | 12,1 ms | 16,2 ms |
+| **Q3 todos os sensores, última hora** | 64,7 ms | 17,1 ms | **15,0 ms** |
+| Q4 varredura total (3 M linhas) | 81,7 ms | 96,9 ms | 96,8 ms |
+| **Q2 via agregado contínuo** | n/a | n/a | **2,0 ms** |
+| Armazenamento (tabela + índices) | 379 MB | 318 MB | 365 MB |
+| **Armazenamento comprimido** | n/a | n/a | **55 MB (6,7x menor)** |
+| Q1 / Q2 com dado comprimido | n/a | n/a | 1,7 ms / 49,6 ms |
+| **Retenção: apagar 24 h (1,56 M linhas)** | 695 ms (`DELETE`) | 209 ms (24 `DROP TABLE`) | **116 ms** (`drop_chunks`) |
+
+**Leitura honesta dos números:**
+
+- **O TimescaleDB NÃO ganha em ingestão nem em consulta de um sensor.** Ingestão empata nos 3 (~31 mil/s): o limite
+  é fsync + manutenção do índice PK no Docker/Windows, com o conjunto inteiro cabendo na RAM. Q1/Q2 ficam um pouco
+  piores (2,0 vs 1,6 ms) porque o planner considera ~50 chunks. Com 3 M de linhas, tudo cabe em memória; a vantagem
+  de chunks em ingestão aparece quando o índice **não cabe mais na RAM**, cenário que este teste não alcança.
+- **Onde ganha:** (1) **poda de chunks** em consultas por janela de tempo entre sensores (Q3: 4x mais rápido que a
+  tabela comum); (2) **agregados contínuos**: a mesma resposta de Q2 em 2 ms em vez de 11 a 16 ms, e a diferença
+  cresce com o volume porque o agregado tem tamanho fixo por bucket; (3) **compressão 6,7x**; (4) **retenção** sem
+  `DELETE` (que deixa bloat e exige VACUUM): `drop_chunks` remove arquivos inteiros.
+- **Contra o particionamento nativo a vantagem é operacional**, não de velocidade bruta: o Timescale cria chunks
+  sozinho (nativo exige criar partições antes, via cron/pg_partman), e traz compressão, agregados contínuos e
+  políticas prontas. Para quem já opera Postgres com pg_partman, o nativo é uma escolha defensável.
+- **Compressão custa consulta analítica:** Q2 sobre chunks comprimidos ficou 3x mais lenta (49,6 vs 16,2 ms), pois
+  descomprime segmentos. Por isso só se comprime dado **frio** (após 7 dias); o quente permanece em linha.
+
+**Decisão:** TimescaleDB, pelo conjunto (poda + agregados + compressão + retenção + automação), e não por
+ingestão. É a resposta correta à pergunta "vale a pena?" para uma plataforma de telemetria: **sim, mas pelos
+motivos certos**.
+
+### D3.2: Chunks de 1 dia
+
+Um chunk (dados + índice PK) deve caber em ~25% da RAM para que o índice quente fique em memória. A 100 mil
+leituras/s o dia tem ~8,6 bi de linhas; o intervalo deve ser revisto com o volume real (o benchmark usou 1 h para
+ter chunks suficientes em poucas horas de dado).
+
+### D3.3: Ciclo de vida em camadas
+
+| Camada | Guarda | Política |
+|---|---|---|
+| Bruto (`readings`) | leitura a leitura | columnstore após 7 dias; **retenção de 90 dias** |
+| `readings_1m` | 1 balde por sensor por minuto | retenção de 1 ano |
+| `readings_1h` | 1 balde por sensor por hora (calculado a partir do de 1 min) | retenção de 5 anos |
+
+Quanto mais grosso o dado, mais tempo se guarda: é barato guardar 1 linha por hora por 5 anos, e proibitivo
+guardar 1 linha por segundo pelo mesmo tempo. Columnstore segmentado por `sensor_id` e ordenado por `ts DESC`: uma
+consulta "histórico de UM sensor" lê só os segmentos dele, já ordenados. `ON CONFLICT DO NOTHING` continua
+deduplicando (e aceitando dado atrasado) **em chunks já comprimidos** (testado).
+
+### D3.4: Agregado contínuo guarda SOMA e CONTAGEM, nunca a média
+
+A média de médias é errada quando as contagens diferem. Exemplo testado: minuto A com 1 leitura de 10 e minuto B com 3
+leituras de 20. Média das médias = 15 (errado); média real = (10 + 60) / 4 = **17,5**. Guardando `sum` e `count`,
+o agregado horário é `sum(sum)/sum(count)`, e qualquer bucket (5 min, 6 h, 1 dia) é recomposto sem perda a partir
+do de 1 min. O agregado de 1 h é **hierárquico** (lê o de 1 min, nunca o bruto).
+
+### D3.5: Agregação em tempo real e a "marca d'água" (achado do teste)
+
+`materialized_only = false`: a consulta une o dado materializado com o ainda não materializado, então o último minuto
+aparece sem esperar o job. **Limite descoberto:** o "ainda não materializado" só cobre dado MAIS NOVO que a marca
+d'água do agregado. Uma leitura **atrasada** cujo balde já ficou atrás da marca não aparece na série até o próximo
+refresh (política de 30 s). É consistência eventual de ≤ 30 s para dado atrasado; aceitável (o dado bruto está
+consultável na hora) e agora coberto por teste. A janela de refresh é de 7 dias (a idade máxima aceita pela
+ingestão): o custo do refresh é proporcional ao que foi **invalidado**, não ao tamanho da janela.
+
+### D3.6: API de séries protege o banco
+
+`GET /api/sensors/{id}/series` valida antes de consultar: buckets permitidos (1m, 5m, 15m, 30m, 1h, 6h, 1d; múltiplos
+de 1 min, a granularidade do agregado mais fino), no máximo **5.000 pontos** por resposta, intervalo de até 366 dias,
+`bucket=auto` (menor bucket que mantém ~500 pontos, ideal para gráfico). Sem esses limites, um
+`from=2020&bucket=1m` devolveria milhões de linhas com uma única requisição. Séries leem **só dos agregados**.
+Buckets diários/horários alinham ao UTC. `GET /api/sensors/{id}/readings` devolve o bruto (limite 10 mil).
+
+### D3.7: Migration sobre dado existente, fora de transação
+
+`create_hypertable(..., migrate_data => true)` converteu a tabela da Fase 2 **com 2.591.852 linhas** em ~18 s (incluindo
+build), sem perder nenhuma (contagem idêntica antes e depois). Agregados contínuos não podem ser criados dentro de
+transação, então as instruções usam `suppressTransaction` (o EF avisa que a migration não é atômica). Todas são
+idempotentes (`IF NOT EXISTS`, `if_not_exists => true`), então uma migration interrompida pode ser reexecutada. O
+`Down` remove agregados e políticas, mas **não** desfaz a hypertable (isso exigiria copiar os dados).
+
+### Bugs encontrados
+
+**1. Número formatado com vírgula na mensagem de erro da API.**
+*Sintoma:* teste esperava `5.000` e a mensagem dizia `5,000`. *Causa raiz:* `{valor:N0}` depende da cultura, e o
+projeto usa `InvariantGlobalization`. *Correção:* mensagens de API não formatam número com cultura; usam o inteiro
+puro (`5000`).
+
+**2. Testes falhando só na suíte completa: agregação em tempo real e a marca d'água.**
+*Sintoma:* 2 testes passavam isolados e falhavam na suíte inteira. *Causa raiz:* outros testes executam
+`refresh_continuous_aggregate(NULL, NULL)`, que empurra a marca d'água até perto de "agora"; os dados de teste
+(recentes) ficavam **atrás** dela e não entravam na agregação em tempo real (ver D3.5). Não era instabilidade do
+banco: era comportamento real do Timescale. *Correção:* o teste de tempo real usa timestamps no futuro (sempre acima
+da marca), o E2E dispara o refresh que a política faria, e um teste novo documenta o limite.
+
+**3. Asserção fraca sobre contagem de mensagens consumidas (design de teste).**
+*Sintoma:* `Duplicated_messages_in_the_log_are_stored_once` estourou 60 s uma vez, e passou isolado. *Causa raiz:*
+esperava `Consumed == 2000`, mas com at-least-once um rebalance pode fazer o consumer reler mensagens e o contador
+passar de 2000. A garantia real do sistema é o número de linhas **no banco**. *Correção:* espera `>=` e a asserção
+de verdade fica no banco.
+
+**4. `show_chunks(newer_than)` excluía o chunk que começa antes do horário dado (erro do teste).**
+Quem começa às 00:00 não é "mais novo que" 09:00. O teste passou a localizar o chunk que **contém** cada leitura.
+
+---
+
+## Fase 4: Redis, o estado quente (último valor)
+
+**Objetivo:** responder "qual o valor deste sensor **agora**?" em tempo constante, sem consultar o histórico.
+
+### D4.1: Último valor em Redis, e Redis é estado DERIVADO
+
+O histórico no banco é a fonte da verdade; o Redis guarda só o "agora" e pode ser perdido e reconstruído (por
+reprocessamento do tópico ou por cache-aside na leitura). Isso muda o que se exige dele: sem replicação sofisticada, com
+AOF `everysec` só para não reconstruir a cada restart.
+
+Estrutura: um **HASH** por sensor (`sensorhub:last:{id}` com `ts` e `value`), TTL de 7 dias renovado a cada escrita
+(sensor aposentado não deixa lixo eterno; expirar não é problema, pois a leitura faz cache-aside).
+
+### D4.2: Escrita "só se for mais novo", atômica, em Lua
+
+Duas instâncias do consumer, uma reentrega ou um dado atrasado poderiam sobrescrever um valor novo por um antigo.
+A escrita é um script Lua: `se ts_novo > ts_armazenado então grava`. O Redis executa scripts de forma **atômica**
+(comparar e gravar não é interrompido), então não há lock nem read-modify-write no cliente. Testado com 8 escritores
+concorrentes gravando 200 timestamps em ordens embaralhadas: sempre converge para o mais novo. O timestamp vai como
+**microssegundos inteiros** (exato em `double` até 2^53), o mesmo grão do banco, e o valor como `"R"` (ida e volta exata).
+
+### D4.3: Consumer group próprio (`sensorhub.lastvalue`), não dentro do de persistência
+
+Poderia ser um passo extra do handler de persistência. Foi separado porque cada grupo tem **falha, lag e offset
+independentes**: uma queda do Redis não trava a gravação no banco (o teste injeta falha de Redis e nada vai à DLQ; o
+lote é repetido até voltar), e um banco lento não deixa o "agora" defasado. O custo é ler o tópico mais uma vez, o que
+no Kafka é barato (leitura sequencial do log). O Worker escolhe quais papéis executa (`Worker:Consumers`), então em
+produção cada papel escala isoladamente.
+
+### D4.4: Reduzir o lote ao valor mais novo por sensor + pipeline
+
+5.000 leituras de 500 sensores viram **500** escritas, e todas vão num único *round trip* (pipeline). O mais novo é
+escolhido pelo **timestamp**, não pela posição no lote (o lote pode ter dado fora de ordem).
+
+### D4.5: Cache-aside na leitura
+
+`GET /api/sensors/{id}/latest`: tenta o Redis (O(1)); se não há (expirou, Redis reiniciou, sensor novo), lê a última
+leitura dos últimos 7 dias no banco e **repovoa** o cache. Sensor sem leitura recente é 404 (sem cache negativo: evita
+esconder um sensor que voltou). `GET /api/sensors/latest?ids=a,b,c` (até 200) devolve vários numa chamada (o dashboard
+inicial), com `ageSeconds` para o cliente decidir se o valor está velho sem comparar relógios.
+
+### D4.6: Redis fora do ar não derruba o processo
+
+`AbortOnConnectFail=false`: API e Worker sobem mesmo sem Redis e reconectam sozinhos. O `/health/ready` reporta
+indisponível (testado), mas o `/health/live` continua ok, e a ingestão (que só depende do Kafka) segue funcionando.
+
+### Resultados medidos
+
+| Cenário | Resultado |
+|---|---|
+| Grupo `lastvalue` drenando ~1,6 milhão de mensagens de backlog (Worker recém-iniciado) | lag 0 em ~25 s: **~60 a 100 mil msgs/s por consumer**, 2 a 3x a vazão de gravação no banco |
+| Valor no Redis vs. última linha do banco (sensor amostrado) | **idênticos**: mesmo timestamp em µs (`1789772077888259`) e mesmo valor |
+| Cobertura | 5.000 chaves para os 5.000 sensores do simulador; TTL 604.768 s (~7 dias) |
+| Recuperação após perder a chave (`DEL`, como se o Redis tivesse reiniciado) | a API devolve o valor correto via banco e repovoa o Redis (testado) |
+
+### Bugs encontrados
+
+**1. Chamada ambígua `long.Parse(RedisValue)` (`CS0121`).**
+`RedisValue` converte implicitamente para `string` **e** para `byte[]`, então o compilador não escolhe entre
+`Parse(string)` e `Parse(ReadOnlySpan<byte>)`. Correção: conversão explícita `(string)campo`. Detalhe de API, mas ilustra
+por que o valor sai do Redis como texto e é interpretado explicitamente (ida e volta exata de `double`).
