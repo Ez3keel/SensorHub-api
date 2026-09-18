@@ -10,6 +10,7 @@
     <Project Path="tests/SensorHub.Application.Tests/SensorHub.Application.Tests.csproj" />
     <Project Path="tests/SensorHub.Domain.Tests/SensorHub.Domain.Tests.csproj" />
     <Project Path="tests/SensorHub.IntegrationTests/SensorHub.IntegrationTests.csproj" />
+    <Project Path="tests/SensorHub.Simulator.Tests/SensorHub.Simulator.Tests.csproj" />
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/SensorHub.Simulator/SensorHub.Simulator.csproj" />
