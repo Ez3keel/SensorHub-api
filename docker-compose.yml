@@ -49,5 +49,25 @@ services:
       KAFKA_CLUSTERS_0_NAME: sensorhub
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
 
+  timescaledb:
+    # PostgreSQL 16 com a extensão TimescaleDB instalada. Na Fase 2 usamos uma tabela Postgres comum;
+    # a Fase 3 a converte em hypertable (e compara com o Postgres puro).
+    image: timescale/timescaledb:latest-pg16
+    container_name: sensorhub-db
+    ports:
+      - "5433:5432"     # 5433 no host: evita colisão com outros Postgres da máquina
+    environment:
+      POSTGRES_USER: sensorhub
+      POSTGRES_PASSWORD: sensorhub
+      POSTGRES_DB: sensorhub
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sensorhub -d sensorhub"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
 volumes:
   kafka-data:
+  db-data:
