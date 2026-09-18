@@ -1,14 +1,19 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Npgsql;
+using StackExchange.Redis;
 using SensorHub.Application.Ingestion;
 using SensorHub.Application.Processing;
+using SensorHub.Application.LatestValues;
+using SensorHub.Application.Queries;
 using SensorHub.Infrastructure.Kafka;
 using SensorHub.Infrastructure.Persistence;
+using SensorHub.Infrastructure.Redis;
 
 namespace SensorHub.Infrastructure;
 
@@ -31,35 +36,67 @@ public static class DependencyInjection
 
     public static IServiceCollection AddPostgresPersistence(this IServiceCollection services, IConfiguration configuration)
     {
-        var connectionString = configuration.GetConnectionString(PersistenceOptions.ConnectionStringName)
-            ?? throw new InvalidOperationException($"ConnectionStrings:{PersistenceOptions.ConnectionStringName} não configurada.");
-
         services.Configure<PersistenceOptions>(configuration.GetSection(PersistenceOptions.SectionName));
 
-        // Um DataSource por processo: é ele que mantém o pool de conexões.
-        services.AddSingleton(_ => NpgsqlDataSource.Create(connectionString));
+        // Um DataSource por processo: é ele que mantém o pool de conexões. A connection string é lida de forma
+        // preguiçosa (na 1ª resolução), depois de toda a configuração estar montada.
+        services.AddSingleton(sp => NpgsqlDataSource.Create(
+            sp.GetRequiredService<IConfiguration>().GetConnectionString(PersistenceOptions.ConnectionStringName)
+            ?? throw new InvalidOperationException($"ConnectionStrings:{PersistenceOptions.ConnectionStringName} não configurada.")));
         services.AddDbContext<SensorHubDbContext>((sp, options) => options.UseNpgsql(sp.GetRequiredService<NpgsqlDataSource>()));
         services.AddSingleton<IReadingStore, PostgresReadingStore>();
+        services.AddSingleton<IReadingQueries, TimescaleReadingQueries>();
         services.AddHostedService<DatabaseMigrator>();
         return services;
     }
 
-    /// <summary>Consumer que persiste leituras no histórico (grupo <c>sensorhub.persistence</c>).</summary>
-    public static IServiceCollection AddReadingPersistenceConsumer(this IServiceCollection services, IConfiguration configuration)
+    /// <summary>Redis como estado quente: último valor por sensor (e, na Fase 5, estado das regras de alerta).</summary>
+    public static IServiceCollection AddRedisState(this IServiceCollection services, IConfiguration configuration)
     {
-        const string name = "persistence";
-        services.Configure<BatchConsumerOptions>(name, configuration.GetSection("Consumers:Persistence"));
-        services.AddSingleton<IDeadLetterSink, KafkaDeadLetterSink>();
-        services.AddSingleton<PersistReadingsHandler>();
+        services.Configure<RedisOptions>(configuration.GetSection(RedisOptions.SectionName));
+        services.AddSingleton<IConnectionMultiplexer>(sp =>
+        {
+            var options = ConfigurationOptions.Parse(sp.GetRequiredService<IOptions<RedisOptions>>().Value.ConnectionString);
+            // O processo sobe mesmo com o Redis fora do ar e reconecta sozinho: o Redis guarda estado derivado,
+            // e a indisponibilidade dele não deve impedir a API de responder ou o consumer de manter a fila.
+            options.AbortOnConnectFail = false;
+            options.ConnectTimeout = 5_000;
+            return ConnectionMultiplexer.Connect(options);
+        });
+        services.AddSingleton<ILastValueStore, RedisLastValueStore>();
+        services.AddSingleton<LastValueService>();
+        return services;
+    }
+
+    /// <summary>Consumer que persiste leituras no histórico (grupo <c>sensorhub.persistence</c>).</summary>
+    public static IServiceCollection AddReadingPersistenceConsumer(this IServiceCollection services, IConfiguration configuration) =>
+        services.AddReadingConsumer<PersistReadingsHandler>(configuration, "persistence", PostgresFailureClassifier.IsPoison);
+
+    /// <summary>Consumer que mantém o último valor de cada sensor no Redis (grupo <c>sensorhub.lastvalue</c>).</summary>
+    public static IServiceCollection AddLastValueConsumer(this IServiceCollection services, IConfiguration configuration) =>
+        services.AddReadingConsumer<UpdateLastValueHandler>(configuration, "lastvalue", isPoison: null);
+
+    /// <summary>
+    /// Registra um consumer de leituras com o SEU consumer group (<c>sensorhub.{name}</c>). Cada grupo é uma
+    /// visão independente do mesmo tópico: tem offset e lag próprios, e falhar ou atrasar não afeta os outros.
+    /// </summary>
+    private static IServiceCollection AddReadingConsumer<THandler>(
+        this IServiceCollection services, IConfiguration configuration, string name, Func<Exception, bool>? isPoison)
+        where THandler : class, IReadingBatchHandler
+    {
+        services.Configure<BatchConsumerOptions>(name, options => options.GroupId = $"sensorhub.{name}");
+        services.Configure<BatchConsumerOptions>(name, configuration.GetSection($"Consumers:{name}"));
+        services.TryAddSingleton<IDeadLetterSink, KafkaDeadLetterSink>();
+        services.AddSingleton<THandler>();
 
         services.AddSingleton<IHostedService>(sp => new KafkaBatchConsumer(
             name,
             sp.GetRequiredService<IOptions<KafkaOptions>>().Value,
             sp.GetRequiredService<IOptionsMonitor<BatchConsumerOptions>>().Get(name),
-            sp.GetRequiredService<PersistReadingsHandler>(),
+            sp.GetRequiredService<THandler>(),
             sp.GetRequiredService<IDeadLetterSink>(),
             sp.GetRequiredService<ILoggerFactory>().CreateLogger($"Consumer.{name}"),
-            PostgresFailureClassifier.IsPoison));
+            isPoison));
         return services;
     }
 }

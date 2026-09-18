@@ -2,6 +2,7 @@ using FluentValidation;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using SensorHub.Application.Ingestion;
+using SensorHub.Application.Queries;
 
 namespace SensorHub.Application;
 
@@ -13,6 +14,13 @@ public static class DependencyInjection
         services.AddSingleton(TimeProvider.System);
         services.AddSingleton<IValidator<ReadingRequest>, ReadingRequestValidator>();
         services.AddSingleton<IngestionService>();
+        return services;
+    }
+
+    public static IServiceCollection AddReadingQueries(this IServiceCollection services)
+    {
+        services.AddSingleton(TimeProvider.System);
+        services.AddSingleton<ReadingQueryService>();
         return services;
     }
 }

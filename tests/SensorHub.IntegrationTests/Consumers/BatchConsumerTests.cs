@@ -52,7 +52,7 @@ public class BatchConsumerTests(PlatformFixture platform)
 
         await EventuallyAsync(async () => await platform.CountReadingsAsync(sensors) == 5000, "5000 leituras persistidas");
         await EventuallyAsync(() => Task.FromResult(GetLag(kafka.BootstrapServers, kafka.ReadingsTopic, group) == 0), "lag do grupo chegou a zero");
-        Assert.Equal(5000, run.Consumer.Consumed);
+        Assert.True(run.Consumer.Consumed >= 5000); // at-least-once: um rebalance pode reler; o banco garante a unicidade
         Assert.Equal(0, run.Consumer.DeadLettered);
     }
 
@@ -67,7 +67,7 @@ public class BatchConsumerTests(PlatformFixture platform)
 
         await using var run = await StartAsync(kafka, PersistHandler());
 
-        await EventuallyAsync(() => Task.FromResult(run.Consumer.Consumed == 2000), "2000 mensagens consumidas");
+        await EventuallyAsync(() => Task.FromResult(run.Consumer.Consumed >= 2000), "ao menos 2000 mensagens consumidas");
         Assert.Equal(1000, await platform.CountReadingsAsync(sensors));
     }
 
@@ -85,7 +85,7 @@ public class BatchConsumerTests(PlatformFixture platform)
         await using var run = await StartAsync(kafka, handler);
 
         await EventuallyAsync(async () => await platform.CountReadingsAsync(sensors) == 2000, "2000 linhas, sem duplicar");
-        await EventuallyAsync(() => Task.FromResult(run.Consumer.Consumed == 2000), "consumo completo");
+        await EventuallyAsync(() => Task.FromResult(run.Consumer.Consumed >= 2000), "consumo completo");
         Assert.True(run.Consumer.TransientRetries >= 1, "o lote deveria ter sido reprocessado");
         Assert.True(handler.Calls >= 2);
         Assert.Equal(2000, await platform.CountReadingsAsync(sensors)); // continua 2000
@@ -178,7 +178,7 @@ public class BatchConsumerTests(PlatformFixture platform)
 
         await using var run = await StartAsync(kafka, handler, isPoison: ex => ex is PoisonDataException);
 
-        await EventuallyAsync(() => Task.FromResult(run.Consumer.Consumed == 200), "lote consumido");
+        await EventuallyAsync(() => Task.FromResult(run.Consumer.Consumed >= 200), "lote consumido");
         Assert.Equal(1, run.Consumer.DeadLettered);
         Assert.Equal(199, handler.Processed.Count); // as 199 boas foram tratadas
         Assert.DoesNotContain(handler.Processed, r => r.Reading.Value == 666);

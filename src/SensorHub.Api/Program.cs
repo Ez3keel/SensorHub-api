@@ -2,6 +2,8 @@ using SensorHub.Api.Infrastructure;
 using SensorHub.Application;
 using SensorHub.Infrastructure;
 using SensorHub.Infrastructure.Kafka;
+using SensorHub.Infrastructure.Persistence;
+using SensorHub.Infrastructure.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -13,9 +15,14 @@ builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
 builder.Services.AddIngestion(builder.Configuration);
 builder.Services.AddKafkaMessaging(builder.Configuration);
 builder.Services.AddKafkaReadingPublisher();
+builder.Services.AddPostgresPersistence(builder.Configuration);
+builder.Services.AddReadingQueries();
+builder.Services.AddRedisState(builder.Configuration);
 
 builder.Services.AddHealthChecks()
-    .AddCheck<KafkaHealthCheck>("kafka", tags: ["ready"]);
+    .AddCheck<KafkaHealthCheck>("kafka", tags: ["ready"])
+    .AddCheck<PostgresHealthCheck>("postgres", tags: ["ready"])
+    .AddCheck<RedisHealthCheck>("redis", tags: ["ready"]);
 
 var app = builder.Build();
 
