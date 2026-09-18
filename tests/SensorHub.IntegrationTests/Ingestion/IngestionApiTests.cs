@@ -9,8 +9,8 @@ using SensorHub.IntegrationTests.Infrastructure;
 
 namespace SensorHub.IntegrationTests.Ingestion;
 
-[Collection(KafkaCollection.Name)]
-public class IngestionApiTests(KafkaFixture kafka)
+[Collection(PlatformCollection.Name)]
+public class IngestionApiTests(PlatformFixture kafka)
 {
     private const string Topic = "sensorhub.readings";
     private readonly HttpClient _http = kafka.Api.CreateClient();
