@@ -26,10 +26,21 @@ Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 var fleet = new SensorFleet(settings.Sensors);
 var factory = new ReadingFactory(fleet, new ReadingFactoryOptions(settings.DuplicateProbability, settings.HotSensorFactor));
 
+using var httpClient = new HttpClient(new SocketsHttpHandler
+{
+    MaxConnectionsPerServer = Math.Max(4, settings.Workers * 2),
+    PooledConnectionLifetime = TimeSpan.FromMinutes(5)
+})
+{
+    BaseAddress = new Uri(settings.Url.TrimEnd('/') + "/"),
+    Timeout = TimeSpan.FromSeconds(30)
+};
+
 IReadingSink sink = settings.Mode switch
 {
     "dry-run" => new CountingSink(),
-    _ => throw new NotSupportedException($"Modo '{settings.Mode}' ainda não suportado.")
+    "http" => new HttpReadingSink(httpClient, settings.ApiKey),
+    _ => throw new NotSupportedException($"Modo '{settings.Mode}' não suportado (use dry-run ou http).")
 };
 
 Console.WriteLine($"Simulador: {settings.Sensors} sensores, {settings.Rate} leituras/s, {settings.DurationSeconds}s, modo {settings.Mode}");
@@ -40,4 +51,6 @@ var report = await new LoadRunner().RunAsync(
     cts.Token);
 
 Console.WriteLine($"Enviadas: {report.Sent:N0}  Falhas: {report.Failed:N0}  Tempo: {report.Elapsed.TotalSeconds:F1}s  Taxa: {report.AchievedRate:N0}/s");
+if (sink is HttpReadingSink http)
+    Console.WriteLine($"Reenvios por backpressure/rede: {http.Retries:N0}");
 return report.Failed > 0 ? 1 : 0;
