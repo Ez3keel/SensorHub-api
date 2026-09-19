@@ -920,3 +920,89 @@ causa com evidência; a hipótese mais provável é o atraso de entrada do segun
 reescrita para verificar a **propriedade** (as 500 novas chegam e nenhuma leitura antiga é relida), com espera generosa, e a suíte passou
 duas vezes seguidas. Se voltar a oscilar, o próximo passo é instrumentar o tempo de rebalance com as métricas desta fase
 (`sensorhub_consumer_rebalances_total`).
+
+
+## Fase 8: Segurança (autenticação, autorização, limites e propriedade dos dados)
+
+Até aqui qualquer um que alcançasse a porta escrevia leituras de qualquer sensor e reconhecia alertas. A fase tem duas identidades diferentes
+de propósito: **dispositivos** (máquinas, alto volume, credencial de longa duração) e **pessoas** (dashboard/administração, credencial curta
+que se renova). Misturá-las obrigaria a escolher entre "a chave do sensor abre o painel" e "o sensor faz login com senha".
+
+### D8.1: Chave de API por dispositivo (ingestão)
+Formato `shk_` + 32 bytes aleatórios do CSPRNG. No banco fica só o **SHA-256** da chave e um "hint" não secreto (os 12 primeiros caracteres)
+para o operador identificá-la. Hash rápido (não PBKDF2) é correto aqui: a chave tem 256 bits de entropia, não há dicionário a atacar, e
+a verificação roda a cada requisição de ingestão. A chave em texto puro aparece **uma única vez** (criação/rotação, com `Cache-Control: no-store`)
+e nunca mais: nem em GET, nem em listagem, nem no banco (teste confere as três coisas). Rotação invalida a anterior; desativar o dispositivo corta a ingestão.
+
+### D8.2: Usuários: PBKDF2 e verificação em tempo constante
+Senha com o `PasswordHasher` do Identity (PBKDF2, salt por senha, iterações no próprio hash, portanto atualizáveis). Login com e-mail inexistente
+executa uma verificação contra um hash "isca", para que o tempo de resposta não revele quais e-mails existem; a mensagem é a mesma
+("Credenciais inválidas.") para e-mail desconhecido, senha errada e usuário desativado.
+
+### D8.3: JWT de acesso curto + refresh token opaco rotativo com detecção de reuso
+- Acesso: JWT HS256 de 15 min, algoritmo **fixado** na validação (rejeita `alg: none` e troca de algoritmo), tolerância de relógio de 30 s, claim curta `role`.
+- Refresh: 32 bytes aleatórios, guardado só como hash, de **uso único**. Cada troca emite um par novo e marca o antigo como usado, dentro de uma *família*.
+  Se um token já usado reaparece, alguém o copiou (ou o cliente legítimo perdeu a resposta): a **família inteira é revogada** e todos precisam autenticar de novo.
+  Logout revoga a família. Coberto por teste de integração (rotação, reuso, logout).
+
+### D8.4: Papéis: Viewer < Operator < Admin, políticas por endpoint
+Leitura = Viewer; reconhecer alerta e criar regras = Operator; dispositivos, usuários e chaves = Admin. Um requisito `MinimumRoleRequirement` ordena
+os papéis, então adicionar um papel intermediário não exige reescrever políticas. Matriz completa testada (401 sem credencial, 403 com papel insuficiente).
+Criação de usuário exige senha forte e só o Admin cria; o primeiro Admin vem de `Security:BootstrapAdmin` (idempotente).
+
+### D8.5: Propriedade dos dados: a chave de um dispositivo só escreve nos sensores dele
+Autenticar não basta: um dispositivo comprometido poderia injetar leituras em sensores alheios e disparar alertas falsos. O `IngestionService` consulta o registro
+de sensores (cache-aside com TTL) e rejeita, **por leitura e com motivo**, sensor desconhecido, de outro dispositivo, inativo, valor fora da faixa plausível ou unidade
+divergente; as válidas do mesmo lote passam (202 parcial; se tudo é rejeitado, 422). Custo: uma consulta em cache por leitura; consistência eventual de até `SensorCacheSeconds`.
+A mesma janela vale para chaves rotacionadas/desativadas (`DeviceCacheSeconds`, 30 s por padrão): é o preço de não ir ao banco a cada requisição, e está documentado no endpoint.
+
+### D8.6: Rate limiting nativo do ASP.NET, com a partição certa em cada caso
+| Rota | Algoritmo | Partição | Por quê |
+|---|---|---|---|
+| Ingestão | token bucket | dispositivo | um dispositivo com laço infinito esgota o SEU balde, não a capacidade dos outros; o burst absorve lotes legítimos |
+| Login/refresh | janela fixa | IP | o usuário ainda é desconhecido; freia força bruta antes do hash de senha, que é caro |
+| API geral | janela deslizante | usuário | limite de folga contra clientes descontrolados |
+
+Respostas 429 em `application/problem+json` com `Retry-After`; o simulador respeita o cabeçalho. Health e métricas nunca são limitados.
+
+### D8.7: `Security:Enabled` e a recusa de subir mal configurado
+Desenvolvimento simples e os testes antigos rodam com a segurança desligada (o restante da API se comporta igual). Ligada, a API **recusa iniciar** sem chave de assinatura
+ou com chave curta (< 32 bytes), e em `Production` também com a chave de desenvolvimento do repositório. Falhar na subida é melhor do que aceitar tokens assinados com um segredo público.
+Os valores de desenvolvimento ficam só em `appsettings.Development.json`, com aviso; produção usa variáveis de ambiente.
+
+### D8.8: Migração com backfill (`AddSecurity`)
+Sensores passam a pertencer a um dispositivo (FK). Sensores já existentes não têm dispositivo, então a migração **insere primeiro um dispositivo por `device_id` distinto** (desativado, sem chave utilizável)
+e só então cria a FK: o inverso falharia em qualquer banco com dados.
+
+### D8.9: Cliente e tokens no navegador
+Access token só em memória; refresh token em `sessionStorage` (some ao fechar a aba, sobrevive ao F5), nunca `localStorage`. Renovação **single-flight** (várias requisições com 401 compartilham UMA renovação:
+o refresh é de uso único e uma segunda tentativa seria lida pela API como roubo). SignalR usa `accessTokenFactory`, que roda a cada (re)conexão e renova antes de expirar. A UI esconde o que o papel não permite,
+mas é cortesia: quem barra é a API. Alternativa mais forte (cookie HttpOnly + CSRF) fica como evolução.
+Reconhecer alerta passou a usar o **usuário do token**; o nome enviado pelo cliente só vale com a segurança desligada (antes qualquer um "reconhecia como" outra pessoa).
+
+### D8.10: Simulador
+A frota vira **um gateway** (um dispositivo, uma chave). `--mode register` faz login de administrador (`--admin-email`, senha por `--admin-password` ou `SENSORHUB_ADMIN_PASSWORD`, que evita o histórico do shell),
+cria o dispositivo com id fixo e grava a chave (`--key-out`). Dispositivo já existente não tem chave recuperável (só rotação), e o simulador avisa.
+
+### Resultados
+- Testes: Domínio 94, Aplicação 129, Simulador 43, dashboard 26 (vitest), integração de segurança 42 contra Postgres/Redis/Kafka reais, e a suíte de integração inteira segue verde.
+- Verificação ponta a ponta com a segurança ligada: `GET /api/sensors` sem token = 401; o simulador cadastrou 1 dispositivo, 24 sensores e 48 regras como administrador; 2.399 leituras enviadas com a chave do dispositivo, 0 falhas, 2.399 linhas no banco.
+- A tela de login do dashboard foi conferida no navegador; o login interativo com senha não foi automatizado (cobertura pelos testes de `auth.ts`).
+
+### Bugs encontrados
+
+**1. O rate limit por dispositivo não isolava ninguém (teste de integração reprovou).**
+*Sintoma:* com o balde do dispositivo A esgotado, o dispositivo B também recebia 429. *Causa raiz:* os esquemas de autenticação são **por política** (JWT × chave de API), então a identidade do dispositivo só passa
+a existir em `HttpContext.User` quando a autorização roda. O limiter estava ANTES da autorização (com um comentário afirmando o contrário), via um chamador anônimo e particionava tudo por IP.
+*Correção:* `UseRateLimiter` depois de `UseAuthorization`. O login (limiter por IP, no controller) continua antes do hash de senha.
+
+**2. O 429 saía como `application/json`, não `problem+json`.** `WriteAsJsonAsync` sobrescreve o `Content-Type` definido antes; é preciso passá-lo como argumento.
+
+**3. Regressão 400 → 404 ao criar sensor com `deviceId` vazio.** Com a checagem de existência do dispositivo antes da validação, um id inválido virou "não encontrado". A forma é validada (construção do domínio) antes da consulta.
+
+**4. Promessa de renovação "presa" no cliente (achada em revisão antes de rodar os testes).** No primeiro desenho o `finally` que zera o single-flight ficava dentro do `try`; o retorno antecipado (sem refresh token) deixava
+a promessa resolvida guardada para sempre e nenhuma renovação futura acontecia. Passou a `run().finally(...)`, com teste dedicado.
+
+**5. Nome do "reconhecido por" era escolhido pelo cliente.** Falha de autorização de dados (personificação), corrigida em D8.9.
+
+**6. Teste de "recusa de subir" esperava a exceção no lugar errado.** O host da `WebApplicationFactory` sobe no construtor, então a falha aparece ali e não na primeira requisição; o teste passou a afirmar isso.

@@ -35,7 +35,7 @@ Três *consumer groups* independentes leem o mesmo tópico: é o que o Kafka faz
 | 5 | Alertas em stream | ✅ |
 | 6 | Tempo real (SignalR) + dashboard React | ✅ |
 | 7 | Observabilidade (OpenTelemetry, lag do consumer) | ✅ |
-| 8 | Segurança e API de administração | ⏳ |
+| 8 | Segurança (JWT, chaves de API por dispositivo, rate limit) e administração | ✅ |
 | 9 | Compose completo + prova de carga | ⏳ |
 | 10 | MQTT (bridge → Kafka) | ⏳ |
 
@@ -43,10 +43,30 @@ Três *consumer groups* independentes leem o mesmo tópico: é o que o Kafka faz
 
 ```bash
 docker compose up -d kafka timescaledb redis prometheus kafka-exporter jaeger grafana   # infraestrutura + observabilidade
-dotnet run --project src/SensorHub.Api           # API de ingestão (http://localhost:5080)
-dotnet run --project src/SensorHub.Worker        # consumers: persistência, último valor e alertas\n(cd web/dashboard && npm install && npm run dev)  # dashboard em http://localhost:5173
-dotnet run --project tools/SensorHub.Simulator -c Release -- --mode register --sensors 300 --rules threshold,nodata   # cadastra a frota + regras\ndotnet run --project tools/SensorHub.Simulator -c Release -- --mode http --sensors 300 --rate 3000 --duration 45 --silence-after 15 --silence-fraction 0.1
+dotnet run --project src/SensorHub.Api           # API (http://localhost:5080); em Development a segurança vem ligada
+dotnet run --project src/SensorHub.Worker        # consumers: persistência, último valor e alertas
+(cd web/dashboard && npm install && npm run dev)  # dashboard em http://localhost:5173
 ```
+
+Cadastre a frota (como administrador) e envie carga com a chave do dispositivo criada:
+
+```bash
+dotnet run --project tools/SensorHub.Simulator -c Release -- --mode register --sensors 300 --rules threshold,nodata \
+  --admin-email admin@sensorhub.local --admin-password Admin-dev-123456 --key-out gateway.key
+dotnet run --project tools/SensorHub.Simulator -c Release -- --mode http --sensors 300 --rate 3000 --duration 45 \
+  --api-key "$(cat gateway.key)" --silence-after 15 --silence-fraction 0.1
+```
+
+O administrador acima existe **só em desenvolvimento** (`appsettings.Development.json`). Para rodar sem autenticação, use `Security__Enabled=false`.
+
+## Segurança
+
+| Quem | Como se autentica | O que pode |
+|---|---|---|
+| Dispositivo | `X-Api-Key: shk_...` (uma por dispositivo, exibida uma única vez, rotacionável) | ingerir leituras **só dos próprios sensores** |
+| Pessoa | `POST /api/auth/login` → JWT de 15 min + refresh rotativo | Viewer lê, Operator reconhece alertas e cria regras, Admin gerencia dispositivos e usuários |
+
+Rate limiting por dispositivo (ingestão), por IP (login) e por usuário (API). Detalhes e bugs encontrados: seção "Fase 8" do `docs/DECISOES-DE-ARQUITETURA.md`.
 
 ## Observabilidade
 
