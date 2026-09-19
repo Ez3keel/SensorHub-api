@@ -223,6 +223,55 @@ public class DeviceSecurityTests(PlatformFixture platform)
     }
 
     [Fact]
+    public async Task The_general_api_is_limited_per_user_and_tells_the_truth_about_when_to_retry()
+    {
+        await using var api = new SecureApi(platform, new() { ["Security:RateLimits:ApiPerMinute"] = "3" });
+        var admin = await api.AdminAsync();
+
+        var responses = new List<HttpResponseMessage>();
+        for (var i = 0; i < 6; i++) responses.Add(await api.SendAsync(HttpMethod.Get, "/api/sensors", admin.AccessToken));
+
+        Assert.Equal(3, responses.Count(r => r.StatusCode == HttpStatusCode.OK));
+        var rejected = responses.First(r => r.StatusCode == HttpStatusCode.TooManyRequests);
+        Assert.Equal(TimeSpan.FromSeconds(10), rejected.Headers.RetryAfter?.Delta); // um segmento da janela, não um "1" otimista
+    }
+
+    private static async Task<List<HttpStatusCode>> LoginAttemptsAsync(SecureApi api, string forwardedFor, int count)
+    {
+        var statuses = new List<HttpStatusCode>();
+        for (var i = 0; i < count; i++)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "/api/auth/login") { Content = JsonContent.Create(new { email = SecureApi.AdminEmail, password = "errada" }) };
+            request.Headers.Add("X-Forwarded-For", forwardedFor);
+            statuses.Add((await api.Http.SendAsync(request)).StatusCode);
+        }
+        return statuses;
+    }
+
+    [Fact]
+    public async Task Behind_a_trusted_proxy_the_login_limit_is_per_client_ip_not_per_proxy()
+    {
+        await using var api = new SecureApi(platform, new() { ["Security:RateLimits:AuthPerMinute"] = "2", ["Security:TrustForwardedHeaders"] = "true" });
+
+        var first = await LoginAttemptsAsync(api, "203.0.113.10", 3);
+        var other = await LoginAttemptsAsync(api, "203.0.113.20", 1);
+
+        Assert.Equal(HttpStatusCode.TooManyRequests, first[2]); // o cliente 1 estourou o SEU limite...
+        Assert.Equal(HttpStatusCode.Unauthorized, other[0]);    // ...e o cliente 2 não foi afetado
+    }
+
+    [Fact]
+    public async Task Without_declaring_a_proxy_a_forged_forwarded_for_header_cannot_dodge_the_limit()
+    {
+        await using var api = new SecureApi(platform, new() { ["Security:RateLimits:AuthPerMinute"] = "2" }); // TrustForwardedHeaders = false
+
+        var statuses = new List<HttpStatusCode>();
+        for (var i = 0; i < 4; i++) statuses.AddRange(await LoginAttemptsAsync(api, $"198.51.100.{i}", 1)); // um "IP" novo a cada tentativa
+
+        Assert.Equal(2, statuses.Count(s => s == HttpStatusCode.TooManyRequests)); // o cabeçalho foi ignorado
+    }
+
+    [Fact]
     public async Task Health_endpoints_are_never_rate_limited()
     {
         await using var api = new SecureApi(platform, new() { ["Security:RateLimits:AuthPerMinute"] = "1", ["Security:RateLimits:IngestionBurst"] = "1" });

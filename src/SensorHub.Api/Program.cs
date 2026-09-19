@@ -43,7 +43,21 @@ builder.Services.AddHealthChecks()
     .AddCheck<PostgresHealthCheck>("postgres", tags: ["ready"])
     .AddCheck<RedisHealthCheck>("redis", tags: ["ready"]);
 
+// Atrás de um proxy (nginx do Compose) o IP de origem vem em X-Forwarded-For; sem isso o limiter de login enxergaria SEMPRE o IP do
+// proxy e todos os usuários dividiriam um único balde. Só se confia no cabeçalho quando o operador declara que a API NÃO é
+// alcançável diretamente: um cliente qualquer poderia forjá-lo e escapar do limite por IP.
+// (lido de forma preguiçosa, via options, para respeitar sobreposições de configuração feitas depois do CreateBuilder)
+builder.Services.AddOptions<Microsoft.AspNetCore.Builder.ForwardedHeadersOptions>().Configure<IConfiguration>((o, configuration) =>
+{
+    if (!configuration.GetValue<bool>("Security:TrustForwardedHeaders")) return; // padrão: ForwardedHeaders.None (o middleware não faz nada)
+    o.ForwardedHeaders = Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedFor | Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedProto;
+    o.KnownIPNetworks.Clear();
+    o.KnownProxies.Clear();
+});
+
 var app = builder.Build();
+
+app.UseForwardedHeaders();
 
 app.Services.ValidateSecurityConfiguration(); // segredo do JWT fraco/ausente derruba a subida, não a primeira requisição
 

@@ -173,7 +173,9 @@ public static class SecurityExtensions
                 if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
                     context.HttpContext.Response.Headers.RetryAfter = ((int)Math.Ceiling(retryAfter.TotalSeconds)).ToString();
                 else
-                    context.HttpContext.Response.Headers.RetryAfter = "1";
+                    // A janela deslizante não informa o tempo de espera. Um segmento dura Window/SegmentsPerWindow = 10 s: só depois dele
+                    // um permit volta a existir. Dizer "1" faria os clientes bem-comportados insistirem inutilmente (medido no cadastro da frota).
+                    context.HttpContext.Response.Headers.RetryAfter = "10";
 
                 // WriteAsJsonAsync sobrescreve o Content-Type se não o receber explicitamente.
                 await context.HttpContext.Response.WriteAsJsonAsync(new
