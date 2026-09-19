@@ -113,7 +113,8 @@ public sealed class AlertRulesController(AlertRuleService rules) : ControllerBas
 [EnableRateLimiting(Policies.ApiLimiter)]
 public sealed class AlertsController(AlertService alerts) : ControllerBase
 {
-    public sealed record AcknowledgeRequest(string User);
+    /// <param name="User">Só vale com a segurança desligada; autenticado, quem reconhece é SEMPRE o usuário do token.</param>
+    public sealed record AcknowledgeRequest(string? User = null);
 
     [HttpGet]
     public async Task<IActionResult> List(
@@ -128,5 +129,5 @@ public sealed class AlertsController(AlertService alerts) : ControllerBase
     [HttpPost("{id:guid}/acknowledge")]
     [Authorize(Policy = Policies.Operator)]
     public async Task<IActionResult> Acknowledge(Guid id, [FromBody] AcknowledgeRequest request, CancellationToken cancellationToken) =>
-        Ok(AlertResponse.From(await alerts.AcknowledgeAsync(id, request.User, cancellationToken)));
+        Ok(AlertResponse.From(await alerts.AcknowledgeAsync(id, User.FindFirst("email")?.Value ?? request.User ?? "", cancellationToken)));
 }
