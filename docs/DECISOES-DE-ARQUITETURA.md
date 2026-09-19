@@ -697,3 +697,104 @@ regras é registrado junto com o Redis (`AddRedisState`), que a API também usa.
 **4. Teste "retoma do offset commitado" instável (design de teste).**
 Parava o consumer assim que o handler terminava, **antes** do commit (que vem depois). Isso é permitido em at-least-once (o lote
 seria reentregue), mas invalida a asserção "não relê nada". O teste passou a esperar o lag chegar a 0.
+
+---
+
+## Fase 6: Tempo real (SignalR + backplane Redis) e o dashboard React
+
+**Objetivo:** mostrar o "agora" de cada sensor e os alertas ao vivo num dashboard, sem que a taxa de ingestão vaze para a
+rede, e com a API escalável horizontalmente.
+
+### D6.1: O tempo real é MAIS um consumer group (`sensorhub.realtime`), dentro da API
+
+```
+Kafka readings ──► [grupo sensorhub.realtime] ──► coalescer ──(flush a cada 250 ms)──► hub SignalR ──► navegadores
+Kafka alerts   ──► [grupo sensorhub.realtime.alerts] ─────────────────────────────────► hub SignalR ──► navegadores
+                     ▲ todas as instâncias da API no MESMO grupo: cada partição é lida por UMA delas
+                                         Redis backplane: o push de uma instância chega aos clientes de TODAS
+```
+
+Duas propriedades trabalham juntas: o **consumer group** reparte a leitura do stream entre as instâncias (nenhuma leitura é
+processada duas vezes) e o **backplane Redis** faz o push chegar ao cliente onde quer que ele esteja conectado. Sem o
+backplane, um cliente ligado à instância A nunca veria as leituras consumidas pela B. Testado com duas instâncias reais da API
+no mesmo grupo: um cliente conectado só na A recebeu as 40 leituras de 40 sensores, incluindo as consumidas pela B. O grupo
+começa do fim do log (`Latest`): um dashboard novo mostra o "agora", não reprocessa o histórico.
+
+### D6.2: Coalescing, ou "a taxa de saída independe da taxa de entrada"
+
+O handler do consumer não empurra nada: só deposita a leitura num buffer "último valor por sensor" (`ReadingCoalescer`, uma
+escrita em memória por leitura). Um timer drena o buffer a cada 250 ms e envia o resultado. Consequências:
+
+- 150 mil leituras/s na entrada continuam sendo, **no máximo, 4 atualizações/s por sensor** na saída.
+- O buffer só aceita valor MAIS NOVO por timestamp: dado atrasado ou reentregue nunca faz o dashboard voltar no tempo.
+- Concorrência sem lock: o drain troca o dicionário de forma atômica (`Interlocked.Exchange`); escritas simultâneas caem no
+  próximo ciclo, e um teste com 20 escritores concorrentes e um leitor drenando garante que o último valor de cada sensor
+  sempre chega.
+
+Testado de ponta a ponta: uma rajada de **3.000 leituras do mesmo sensor** chegou ao cliente em **menos de 100 mensagens**,
+com o último valor (2999) sempre entregue.
+
+### D6.3: Duas granularidades de assinatura, e a segunda só custa quando há quem assista
+
+1. **`group:{nome}`**: uma mensagem por grupo de sensores a cada flush, com todas as leituras coalescidas do grupo. A rede vê
+   dezenas de mensagens por segundo, não milhares. Alimenta a grade de cartões.
+2. **`sensor:{id}`**: leituras de UM sensor, para o gráfico de detalhe. Só é alimentado enquanto **alguém assiste** esse sensor.
+   Como quem consome a partição do sensor pode não ser a instância onde o navegador está conectado, a contagem de assinantes
+   vive no **Redis** (HASH sensorId → contagem, ajustado atomicamente por Lua, campo removido ao chegar a zero) e o fanout
+   consulta essa lista (cache de 1 s). Sem isso, seria preciso publicar milhares de mensagens no backplane para grupos vazios.
+
+Limitação assumida e documentada: se uma instância morre sem desconectar seus clientes, as contagens dela vazam. O efeito é só
+empurrar mensagens por sensor para um grupo vazio, e a chave inteira expira sozinha após 1 h sem escritas.
+
+O hub também impõe limites por conexão (50 sensores, 10 grupos, nome de grupo de até 100 caracteres): um cliente não pode
+assinar o sistema inteiro.
+
+### D6.4: Alertas: imediatos, deduplicados e best-effort por desenho
+
+Eventos de alerta são poucos: sem coalescing, empurrados na hora para o grupo `alerts` e para `sensor:{id}`. O motor é
+at-least-once (pode republicar após uma queda), então o listener descarta o que já viu por `(AlertId, Kind)` (LRU de 10 mil).
+O listener usa auto-commit e `Latest`: **é uma visão viva, não uma fila de entrega**. Se uma instância cai, o dashboard recarrega
+os alertas abertos pela API REST (o Postgres é quem guarda a verdade). Confiabilidade forte aqui seria custo sem benefício.
+
+### D6.5: No SignalR os grupos pertencem à conexão
+
+Uma queda de rede perde silenciosamente TODAS as assinaturas. O `TelemetryClient` guarda o que o usuário assinou e **refaz** as
+assinaturas a cada reconexão automática (backoff 0/1/2/5/10/30 s).
+
+### D6.6: Front-end (React + TypeScript estrito, Vite, Recharts)
+
+- **Lógica de estado fora do React** (`telemetryState.ts`), pura e coberta por testes (vitest): aplicar leituras ignora dado
+  antigo, histórico limitado a 60 pontos por sensor (memória não cresce com o tempo), semeadura pelo REST nunca sobrescreve um
+  valor ao vivo mais novo, evento de alerta é idempotente e retorna a MESMA referência quando é duplicata (nenhuma
+  re-renderização), ordenação por severidade e depois recência.
+- **Um lote por quadro de animação**: as mensagens são acumuladas num buffer e aplicadas ao estado do React no máximo uma vez
+  por `requestAnimationFrame`.
+- **Cartão "apagado"** quando não há leitura há mais de 30 s (o sensor pode estar offline); cartão com borda vermelha quando há
+  alerta aberto.
+- **Detalhe:** últimos 5 min (REST bruto + push ao vivo, mesclados por timestamp) ou séries agregadas de 1 h a 7 d
+  (média/mín/máx dos agregados contínuos). O período longo usa `bucket=auto` do servidor.
+- **CORS** com origens explícitas e credenciais (o SignalR com WebSocket não aceita "qualquer origem" com credenciais); em dev
+  o Vite faz proxy de `/api` e `/hubs` e o navegador enxerga uma origem só.
+
+### Resultados
+
+| Verificação | Resultado |
+|---|---|
+| Testes de integração do tempo real (SignalR real, Kafka real, Redis real) | 10, todos passando, incluindo o de **2 instâncias + backplane** |
+| Coalescing | 3.000 leituras de um sensor → < 100 mensagens; valor final sempre entregue |
+| Dashboard em execução (API + Worker + simulador 1.500 leituras/s, 300 sensores, 5% dos sensores morrendo aos 90 s) | conectado "ao vivo", cartões e sparklines atualizando, toasts de alertas críticos, **16 alertas abertos** (críticos em vermelho, "Sensor offline" em amarelo) |
+| Front-end | TypeScript estrito compila; 11 testes vitest; bundle de 607 kB (172 kB gzip) |
+
+### Bugs encontrados
+
+**1. Toasts duplicados e alertas em dobro (achado ao olhar o dashboard rodando, não pelos testes).**
+*Sintoma:* o mesmo alerta aparecia 2 a 3 vezes e havia mais de 4 toasts empilhados. *Causa raiz:* o React StrictMode (dev) monta
+o efeito duas vezes; o primeiro cliente SignalR era parado durante a negociação, mas o `start()` reagendava uma nova tentativa
+**depois de parado**, ressuscitando um cliente "zumbi" que alimentava o mesmo estado. *Correção:* um cliente parado nunca
+reconecta e fica mudo (não emite mais status nem eventos, para não piscar o badge de "desconectado" por cima do cliente novo);
+toasts deduplicados por alerta. O erro `The connection was stopped during negotiation` no console em dev é exatamente esse
+primeiro cliente sendo parado e é esperado.
+
+**2. Asserção frágil sobre a atribuição de partições (design de teste).**
+O teste das duas instâncias conferia `Members[].Assignment` da Admin API, que vem vazia com rebalance cooperativo. A garantia real
+(2 membros no grupo e o cliente recebendo as leituras das DUAS instâncias) já estava coberta; a asserção frágil foi removida.
