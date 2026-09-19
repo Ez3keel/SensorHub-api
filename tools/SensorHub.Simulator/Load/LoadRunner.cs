@@ -8,7 +8,10 @@ public interface IReadingSink
     Task SendAsync(IReadOnlyList<SimulatedReading> batch, CancellationToken cancellationToken);
 }
 
-public sealed record LoadOptions(int RatePerSecond, TimeSpan Duration, int BatchSize = 100, int Workers = 1);
+public sealed record LoadOptions(
+    int RatePerSecond, TimeSpan Duration, int BatchSize = 100, int Workers = 1,
+    /// <summary>Depois deste tempo, <see cref="SilenceFraction"/> dos sensores param de emitir (cenário "sensor morreu").</summary>
+    TimeSpan? SilenceAfter = null, double SilenceFraction = 0);
 
 public sealed record LoadReport(long Sent, long Failed, TimeSpan Elapsed)
 {
@@ -31,6 +34,7 @@ public sealed class LoadRunner
         if (options.Workers <= 0) throw new ArgumentOutOfRangeException(nameof(options), "Workers deve ser > 0.");
 
         long sent = 0, failed = 0;
+        var silenced = false;
         var clock = Stopwatch.StartNew();
         var perWorkerRate = (double)options.RatePerSecond / options.Workers;
 
@@ -49,7 +53,16 @@ public sealed class LoadRunner
 
                 var size = (int)Math.Min(deficit, options.BatchSize);
                 List<SimulatedReading> batch;
-                lock (_factoryLock) batch = factory.NextBatch(size, DateTimeOffset.UtcNow);
+                lock (_factoryLock)
+                {
+                    if (!silenced && options.SilenceAfter is { } after && clock.Elapsed >= after)
+                    {
+                        silenced = true;
+                        factory.SilenceFraction(options.SilenceFraction);
+                    }
+
+                    batch = factory.NextBatch(size, DateTimeOffset.UtcNow);
+                }
                 workerSent += size;
 
                 try

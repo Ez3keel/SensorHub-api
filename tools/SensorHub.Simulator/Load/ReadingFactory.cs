@@ -18,7 +18,8 @@ public sealed class ReadingFactory
     private readonly ReadingFactoryOptions _options;
     private readonly SignalGenerator[] _generators;
     private readonly long[] _lastTicks;
-    private readonly int[] _schedule;
+    private readonly HashSet<int> _silenced = [];
+    private int[] _schedule;
     private readonly Random _random;
     private readonly Queue<SimulatedReading> _recent = new();
     private int _cursor;
@@ -44,6 +45,26 @@ public sealed class ReadingFactory
 
     public SensorFleet Fleet => _fleet;
 
+    /// <summary>Quantos sensores estão "mortos" (não emitem mais).</summary>
+    public int SilencedCount => _silenced.Count;
+
+    /// <summary>
+    /// Silencia uma fração dos sensores (a partir do fim da lista, para não afetar o sensor #0 "quente"): eles param de
+    /// emitir. Simula sensores que morrem, para exercitar os alertas de "sem dados". Retorna os índices silenciados.
+    /// </summary>
+    public IReadOnlyList<int> SilenceFraction(double fraction)
+    {
+        if (fraction is < 0 or > 1) throw new ArgumentOutOfRangeException(nameof(fraction));
+
+        var count = (int)Math.Round(_fleet.Sensors.Count * fraction);
+        var victims = Enumerable.Range(_fleet.Sensors.Count - count, count).Where(i => i > 0).ToList();
+        foreach (var index in victims) _silenced.Add(index);
+
+        _schedule = _schedule.Where(i => !_silenced.Contains(i)).ToArray();
+        _cursor = 0;
+        return victims;
+    }
+
     public List<SimulatedReading> NextBatch(int count, DateTimeOffset now)
     {
         var batch = new List<SimulatedReading>(count);
@@ -55,6 +76,7 @@ public sealed class ReadingFactory
                 continue;
             }
 
+            if (_schedule.Length == 0) break; // todos silenciados: nada a emitir
             var index = _schedule[_cursor++ % _schedule.Length];
             var sensor = _fleet.Sensors[index];
 

@@ -13,7 +13,11 @@ public sealed record SimulatorSettings(
     double DuplicateProbability,
     int HotSensorFactor,
     string Url,
-    string ApiKey)
+    string ApiKey,
+    string Rules,
+    int NoDataSeconds,
+    int SilenceAfterSeconds,
+    double SilenceFraction)
 {
     public static SimulatorSettings Parse(string[] args)
     {
@@ -41,10 +45,14 @@ public sealed record SimulatorSettings(
             DuplicateProbability: GetDouble("duplicates", 0),
             HotSensorFactor: GetInt("hot", 1),
             Url: Get("url", "http://localhost:5080"),
-            ApiKey: Get("api-key", ""));
+            ApiKey: Get("api-key", ""),
+            Rules: Get("rules", ""),
+            NoDataSeconds: GetInt("nodata-seconds", 20),
+            SilenceAfterSeconds: GetInt("silence-after", 0),
+            SilenceFraction: GetDouble("silence-fraction", 0));
 
         var unknown = map.Keys.Except(
-            ["mode", "sensors", "rate", "duration", "batch", "workers", "duplicates", "hot", "url", "api-key"],
+            ["mode", "sensors", "rate", "duration", "batch", "workers", "duplicates", "hot", "url", "api-key", "rules", "nodata-seconds", "silence-after", "silence-fraction"],
             StringComparer.OrdinalIgnoreCase).ToList();
         if (unknown.Count > 0)
             throw new ArgumentException($"Opção desconhecida: {string.Join(", ", unknown.Select(u => "--" + u))}");
@@ -55,7 +63,8 @@ public sealed record SimulatorSettings(
     public const string Usage = """
         SensorHub.Simulator: gerador de carga de leituras de sensores
 
-          --mode dry-run|http     destino das leituras (padrão: dry-run, só mede o gerador)
+          --mode dry-run|http|register
+                                  dry-run: só mede o gerador | http: envia leituras | register: cadastra a frota na API
           --sensors N             quantidade de sensores da frota (padrão 100)
           --rate N                leituras por segundo, total (padrão 1000)
           --duration S            duração em segundos (padrão 10)
@@ -65,5 +74,9 @@ public sealed record SimulatorSettings(
           --hot N                 o sensor #0 emite N vezes mais que os outros (padrão 1)
           --url URL               base da API no modo http (padrão http://localhost:5080)
           --api-key KEY           chave de API do dispositivo (modo http)
+          --rules LIST            (register) regras a criar por sensor: threshold,nodata
+          --nodata-seconds N      (register) silêncio máximo da regra "sem dados" (padrão 20)
+          --silence-after S       (http) depois de S segundos, parte da frota para de emitir
+          --silence-fraction P    (http) fração [0,1] da frota que "morre" em --silence-after
         """;
 }

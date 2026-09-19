@@ -155,6 +155,50 @@ public class ReadingFactoryTests
     }
 
     [Fact]
+    public void Silenced_sensors_stop_emitting_and_the_rest_keep_going()
+    {
+        var fleet = new SensorFleet(20);
+        var factory = new ReadingFactory(fleet);
+        factory.NextBatch(20, T0); // todos emitem antes
+
+        var victims = factory.SilenceFraction(0.25);
+        var after = Enumerable.Range(0, 50).SelectMany(i => factory.NextBatch(20, T0.AddSeconds(i + 1))).ToList();
+
+        Assert.Equal(5, victims.Count);
+        Assert.Equal(5, factory.SilencedCount);
+        var silencedIds = victims.Select(i => fleet.Sensors[i].Id).ToHashSet();
+        Assert.DoesNotContain(after, r => silencedIds.Contains(r.SensorId));
+        Assert.Equal(15, after.Select(r => r.SensorId).Distinct().Count()); // os 15 restantes seguem emitindo
+    }
+
+    [Fact]
+    public void Silencing_never_kills_the_hot_sensor_zero()
+    {
+        var factory = new ReadingFactory(new SensorFleet(10));
+
+        var victims = factory.SilenceFraction(1.0);
+
+        Assert.DoesNotContain(0, victims);
+    }
+
+    [Fact]
+    public void A_fleet_of_one_keeps_emitting_because_sensor_zero_is_never_silenced()
+    {
+        var factory = new ReadingFactory(new SensorFleet(1));
+        factory.SilenceFraction(1.0);
+
+        Assert.NotEmpty(factory.NextBatch(3, T0));
+    }
+
+    [Theory]
+    [InlineData(-0.1)]
+    [InlineData(1.1)]
+    public void Silence_fraction_must_be_a_valid_probability(double fraction)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ReadingFactory(new SensorFleet(5)).SilenceFraction(fraction));
+    }
+
+    [Fact]
     public void Rejects_invalid_options()
     {
         var fleet = new SensorFleet(2);
@@ -207,6 +251,34 @@ public class LoadRunnerTests
         var report = await new LoadRunner().RunAsync(factory, sink, new LoadOptions(2000, TimeSpan.FromSeconds(1.5), BatchSize: 50, Workers: 4));
 
         Assert.InRange(report.Sent, 2400, 3600);
+    }
+
+    [Fact]
+    public async Task Scheduled_silence_stops_part_of_the_fleet_mid_run()
+    {
+        var sink = new RecordingSink();
+        var fleet = new SensorFleet(20);
+        var factory = new ReadingFactory(fleet);
+
+        await new LoadRunner().RunAsync(factory, sink,
+            new LoadOptions(2000, TimeSpan.FromSeconds(1.5), BatchSize: 50, SilenceAfter: TimeSpan.FromSeconds(0.5), SilenceFraction: 0.5));
+
+        Assert.Equal(10, factory.SilencedCount);
+        var all = sink.Readings;
+        var late = all.Where(r => r.Timestamp > all.Min(x => x.Timestamp).AddSeconds(0.9)).ToList();
+        Assert.True(late.Select(r => r.SensorId).Distinct().Count() <= 10, "depois do silêncio só metade da frota emite");
+    }
+
+    private sealed class RecordingSink : IReadingSink
+    {
+        private readonly List<SimulatedReading> _all = [];
+        public IReadOnlyList<SimulatedReading> Readings { get { lock (_all) return _all.ToList(); } }
+
+        public Task SendAsync(IReadOnlyList<SimulatedReading> batch, CancellationToken cancellationToken)
+        {
+            lock (_all) _all.AddRange(batch);
+            return Task.CompletedTask;
+        }
     }
 
     [Fact]

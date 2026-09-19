@@ -36,6 +36,17 @@ using var httpClient = new HttpClient(new SocketsHttpHandler
     Timeout = TimeSpan.FromSeconds(30)
 };
 
+if (settings.Mode == "register")
+{
+    var rules = settings.Rules.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(r => r.ToLowerInvariant()).ToHashSet();
+    var registration = await new FleetRegistrar(httpClient).RegisterAsync(
+        fleet, rules.Contains("threshold"), rules.Contains("nodata"), settings.NoDataSeconds, cancellationToken: cts.Token);
+    Console.WriteLine($"Cadastro: {registration.SensorsCreated} sensores criados, {registration.SensorsAlreadyExisted} já existiam, " +
+                      $"{registration.RulesCreated} regras criadas, {registration.Failures} falhas.");
+    return registration.Failures > 0 ? 1 : 0;
+}
+
 IReadingSink sink = settings.Mode switch
 {
     "dry-run" => new CountingSink(),
@@ -47,7 +58,8 @@ Console.WriteLine($"Simulador: {settings.Sensors} sensores, {settings.Rate} leit
 
 var report = await new LoadRunner().RunAsync(
     factory, sink,
-    new LoadOptions(settings.Rate, TimeSpan.FromSeconds(settings.DurationSeconds), settings.BatchSize, settings.Workers),
+    new LoadOptions(settings.Rate, TimeSpan.FromSeconds(settings.DurationSeconds), settings.BatchSize, settings.Workers,
+        settings.SilenceAfterSeconds > 0 ? TimeSpan.FromSeconds(settings.SilenceAfterSeconds) : null, settings.SilenceFraction),
     cts.Token);
 
 Console.WriteLine($"Enviadas: {report.Sent:N0}  Falhas: {report.Failed:N0}  Tempo: {report.Elapsed.TotalSeconds:F1}s  Taxa: {report.AchievedRate:N0}/s");
