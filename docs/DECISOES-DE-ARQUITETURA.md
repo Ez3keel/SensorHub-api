@@ -798,3 +798,125 @@ primeiro cliente sendo parado e é esperado.
 **2. Asserção frágil sobre a atribuição de partições (design de teste).**
 O teste das duas instâncias conferia `Members[].Assignment` da Admin API, que vem vazia com rebalance cooperativo. A garantia real
 (2 membros no grupo e o cliente recebendo as leituras das DUAS instâncias) já estava coberta; a asserção frágil foi removida.
+
+---
+
+## Fase 7: Observabilidade (métricas, lag do consumer e tracing através do Kafka)
+
+**Objetivo:** responder, com dados e não com palpite, "o sistema está acompanhando a ingestão?", "quanto tempo uma leitura leva
+até estar gravada?" e "onde foi parar a requisição X?", inclusive quando ela atravessa uma fila.
+
+### D7.1: Três sinais, cada um para uma pergunta
+
+| Sinal | Ferramenta | Responde |
+|---|---|---|
+| Métricas | OpenTelemetry → endpoint `/metrics` → **Prometheus** → **Grafana** | "Está saudável? Está acompanhando? Quão rápido?" |
+| Traces | OpenTelemetry → OTLP → **Jaeger** | "Onde esta requisição específica gastou tempo?" |
+| Logs | console estruturado (sem backend de logs, fora do escopo) | "O que aconteceu neste erro?" |
+
+A Application usa só a BCL (`System.Diagnostics.Metrics` e `ActivitySource`): não depende de OpenTelemetry. O host (API/Worker) é quem
+liga o OpenTelemetry aos nomes `SensorHub`, `Npgsql` e ao runtime do .NET.
+
+### D7.2: O lag do consumer é a métrica mais importante, e é medido de duas formas de propósito
+
+Em um sistema de streaming, CPU alta com lag zero é um sistema feliz e CPU baixa com lag crescendo é um sistema falhando em silêncio.
+O lag é o **efeito** que o usuário sente (dado atrasado). Duas medições:
+
+1. **Dentro do consumer** (`sensorhub_consumer_lag{group,topic,partition}`): o librdkafka emite estatísticas a cada 5 s com o lag de cada
+   partição que o consumer lê; o consumer as publica num registro cujo snapshot é **substituído atomicamente**, então uma partição
+   cedida a outra instância some do gauge (senão ficaria congelada e daria falso alarme).
+2. **De fora, pelo broker** (`kafka_consumergroup_lag`, via `kafka-exporter`): continua existindo mesmo se TODOS os consumers do grupo
+   morrerem.
+
+**Evidência real, observada no Grafana:** ao reiniciar o Worker durante a carga, o lag medido **pelo broker chegou a 123 mil**, enquanto
+o gauge **interno só registrou 24,5 mil de pico**, porque o gauge some junto com o consumer parado. É exatamente o cenário em que o lag
+mais importa (o consumer caiu) e a medição interna é a mais cega. O alerta de produção deve usar a medição externa.
+
+### D7.3: Atraso ponta a ponta, a métrica de SLO
+
+Cada leitura carrega `ingestedAt` (o instante em que a API a aceitou). Ao fim de cada lote o consumer registra
+`agora - ingestedAt` do dado mais novo (`sensorhub_consumer_processing_delay_seconds`). É a resposta direta a "quanto tempo uma leitura
+leva até estar gravada / avaliada / empurrada para o dashboard?", por consumer group. Medido com 3.000 leituras/s:
+
+| Grupo | p50 | p95 | p99 |
+|---|---|---|---|
+| `realtime` | 32 ms | 75 ms | 96 ms |
+| `lastvalue` | 41 ms | 126 ms | 225 ms |
+| `alerts` | 87 ms | 231 ms | 246 ms |
+| `persistence` | 124 ms | 237 ms | 247 ms |
+
+### D7.4: Tracing propagado através da fila
+
+O Kafka é uma parede para o trace: sem propagação ele termina no producer. O contexto W3C (`traceparent`/`tracestate`) viaja nos
+**headers da mensagem**: o producer injeta o contexto do span de publicação; o consumer o extrai.
+
+- **Um span por lote publicado, não por mensagem**, e o contexto do span vai em todas as mensagens do lote.
+- **Consumo em lote:** um lote mistura mensagens de várias requisições (traces diferentes). Convenção do OpenTelemetry: o span do lote
+  **continua o trace da primeira mensagem** e tem **links** para os das demais (limitados a 10, senão um lote de milhares de
+  requisições geraria milhares de links). Testado: 3 requisições independentes → os 3 traces ficam cobertos (como pai ou como link).
+- O trace segue mais adiante: o motor de alertas injeta o contexto no evento de alerta, e o listener do tempo real o continua.
+
+**Forma medida de um trace real** (Jaeger), 13 spans em 2 serviços e 2 saltos de Kafka:
+`POST api/readings/batch` → `sensorhub.readings publish` → 3× `sensorhub.readings process` (persistência, último valor, alertas) →
+`MGET` (Redis) + 3× `postgresql` → `sensorhub.alerts publish` → 2× `sensorhub.alerts process` (push ao dashboard na API).
+A amostragem é por razão respeitando o pai (`ParentBased(TraceIdRatioBased)`, configurável): se a API amostrou a requisição, o consumer
+mantém a decisão e o trace nunca fica pela metade. Health checks e `/metrics` são filtrados para não poluir os traces.
+
+### D7.5: O Worker virou um host web mínimo
+
+Um processo de fundo sem porta é invisível para o Prometheus e para os probes de container. O Worker agora sobe o Kestrel só para
+`/metrics`, `/health/live` e `/health/ready` (readiness checa Kafka, Postgres e Redis conforme os papéis que ele executa). Os consumers
+continuam sendo hosted services.
+
+### D7.6: Cardinalidade das métricas (o que NÃO virou label)
+
+Labels: `group`, `topic`, `partition` (6), `result`, `kind`, `severity`, `rule_type`, `reason`. **Nunca `sensor_id`**: com 5.000 sensores
+cada métrica multiplicaria por 5.000 séries e derrubaria o Prometheus. "O que houve com o sensor X" é pergunta de trace ou de log, não de
+métrica.
+
+### D7.7: Grafana como código
+
+O dashboard (14 painéis, 4 seções: ingestão, **lag**, consumers, persistência/alertas/tempo real) é provisionado por arquivo, junto com
+as fontes de dados (Prometheus e Jaeger). `docker compose up` entrega tudo pronto, sem clique manual, e o dashboard versiona no git.
+
+### Resultados
+
+| Verificação | Resultado |
+|---|---|
+| Trace real atravessando HTTP → Kafka → consumers → Postgres/Redis → alerta → dashboard | 13 spans, 2 serviços, spans de lote com 10 links |
+| Latência da API (POST de 100 leituras), simulador a 3.000/s | p50 19 ms, p99 63 ms em regime; pico de 242 ms durante o restart do Worker |
+| Atraso ponta a ponta | p50 32 a 124 ms, p99 ≤ 250 ms em todos os grupos (tabela em D7.3) |
+| Testes | 352 passando no total (71 domínio, 41 simulador, 87 application, 153 integração) |
+
+### Bugs encontrados
+
+**1. Todo quantil de atraso saía como "2,5 s" ou "4,75 s" (artefato de buckets).**
+*Sintoma:* os 4 grupos mostravam p50 = 2,5 s e p95 = 4,75 s, números idênticos e sem sentido. *Causa raiz:* as buckets padrão do
+OpenTelemetry (0, 5, 10, 25, 50...) foram pensadas para milissegundos; um histograma em **segundos** com valores de 0 a 5 cai inteiro no
+primeiro balde e o Prometheus interpola o ponto médio. *Correção:* buckets explícitas por métrica (`AddView`), e os quantis reais
+apareceram (p50 32 a 124 ms). Coberto por teste que confere as buckets no `/metrics`. Lição: um percentil bonito e redondo é suspeito.
+
+**2. O gauge de lag interno some junto com o consumer que o reportava (achado observando um restart real).**
+Ver D7.2: 123 mil medidos pelo broker contra 24,5 mil internos. Não era bug de código, mas uma limitação de desenho que só a
+observação real expôs; a correção é a segunda medição (kafka-exporter) e a recomendação de alertar sobre ela.
+
+**3. Teste do trace dependente de ordem (design de teste).**
+A API publicava no tópico de produção, cheio de mensagens de outros testes; a mensagem do teste caía no meio de um lote e virava **link**
+em vez de **pai** do span do consumer (comportamento correto, mas o teste assumia "primeira do lote"). Correção: tópico isolado por teste.
+Um segundo erro no mesmo teste: o nome do span do consumer é `"{tópico} process"`, e ao isolar o tópico o nome mudou.
+
+**4. Métricas HTTP ausentes no `/metrics` só nos testes.**
+Com vários hosts (`WebApplicationFactory`) no mesmo processo, o `Meter` do ASP.NET Core (criado por host via `IMeterFactory`) não é visto
+pelo OpenTelemetry. No processo real da API as métricas HTTP aparecem (conferido no scrape do Prometheus); a asserção foi removida do teste
+com um comentário explicando, e o restante (métricas de negócio e o endpoint) continua coberto.
+
+**5. Ambiguidade de `Program` (`CS0433`).**
+Ao converter o Worker para o SDK Web, o `Program` dele passou a ser visível e colidiu com o da API no projeto de testes, que nem usava o
+Worker. Removida a referência de projeto desnecessária.
+
+**6. Teste "retoma do offset commitado" continuou oscilando sob carga (causa raiz NÃO comprovada).**
+Mesmo depois de esperar o commit (lag 0), sob a suíte inteira (muitos containers disputando a máquina) ele estourava por tempo. Não isolei a
+causa com evidência; a hipótese mais provável é o atraso de entrada do segundo consumer no grupo sob carga. Em vez de esconder, a asserção foi
+reescrita para verificar a **propriedade** (as 500 novas chegam e nenhuma leitura antiga é relida), com espera generosa, e a suíte passou
+duas vezes seguidas. Se voltar a oscilar, o próximo passo é instrumentar o tempo de rebalance com as métricas desta fase
+(`sensorhub_consumer_rebalances_total`).

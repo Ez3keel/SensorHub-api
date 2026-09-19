@@ -34,7 +34,7 @@ Três *consumer groups* independentes leem o mesmo tópico: é o que o Kafka faz
 | 4 | Redis: último valor (janelas na Fase 5) | ✅ |
 | 5 | Alertas em stream | ✅ |
 | 6 | Tempo real (SignalR) + dashboard React | ✅ |
-| 7 | Observabilidade (OpenTelemetry, lag do consumer) | ⏳ |
+| 7 | Observabilidade (OpenTelemetry, lag do consumer) | ✅ |
 | 8 | Segurança e API de administração | ⏳ |
 | 9 | Compose completo + prova de carga | ⏳ |
 | 10 | MQTT (bridge → Kafka) | ⏳ |
@@ -42,11 +42,22 @@ Três *consumer groups* independentes leem o mesmo tópico: é o que o Kafka faz
 ## Executando localmente
 
 ```bash
-docker compose up -d kafka timescaledb redis   # infraestrutura
+docker compose up -d kafka timescaledb redis prometheus kafka-exporter jaeger grafana   # infraestrutura + observabilidade
 dotnet run --project src/SensorHub.Api           # API de ingestão (http://localhost:5080)
 dotnet run --project src/SensorHub.Worker        # consumers: persistência, último valor e alertas\n(cd web/dashboard && npm install && npm run dev)  # dashboard em http://localhost:5173
 dotnet run --project tools/SensorHub.Simulator -c Release -- --mode register --sensors 300 --rules threshold,nodata   # cadastra a frota + regras\ndotnet run --project tools/SensorHub.Simulator -c Release -- --mode http --sensors 300 --rate 3000 --duration 45 --silence-after 15 --silence-fraction 0.1
 ```
+
+## Observabilidade
+
+| O quê | Onde |
+|---|---|
+| Dashboard (lag, latência, throughput) | http://localhost:3001 (Grafana, sem login) |
+| Traces (HTTP → Kafka → consumer → banco) | http://localhost:16686 (Jaeger) |
+| Métricas brutas | API http://localhost:5080/metrics, Worker http://localhost:9464/metrics |
+| Prometheus | http://localhost:9091 |
+
+Para enviar os traces, inicie API e Worker com `Observability__OtlpEndpoint=http://localhost:14317`.
 
 ## Testes
 
