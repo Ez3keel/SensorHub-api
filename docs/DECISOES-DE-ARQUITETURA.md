@@ -579,3 +579,121 @@ indisponível (testado), mas o `/health/live` continua ok, e a ingestão (que s�
 `RedisValue` converte implicitamente para `string` **e** para `byte[]`, então o compilador não escolhe entre
 `Parse(string)` e `Parse(ReadOnlySpan<byte>)`. Correção: conversão explícita `(string)campo`. Detalhe de API, mas ilustra
 por que o valor sai do Redis como texto e é interpretado explicitamente (ida e volta exata de `double`).
+
+---
+
+## Fase 5: Alertas em stream
+
+**Objetivo:** avaliar regras sobre o fluxo de leituras, sem disparar alerta duplicado a cada leitura, sem perder alerta em
+falha e sem falso positivo quando o sistema reprocessa histórico.
+
+### D5.1: O motor é um terceiro consumer group, lendo o mesmo tópico
+
+`sensorhub.alerts` lê `sensorhub.readings` com offsets e lag próprios, ao lado de `persistence` e `lastvalue`. Isso é
+exatamente o que uma fila tradicional não faz sem duplicar mensagens: um motor novo (ou uma regra nova) pode ser
+avaliado sobre o histórico retido apenas com um `group.id` novo. Testado: um segundo grupo relê o mesmo fluxo e não gera
+nenhum alerta a mais.
+
+### D5.2: Ordem das escritas: persistir, publicar, salvar o estado (por último)
+
+```
+lote de leituras -> avalia regras (funções puras do domínio) -> transições
+   1. INSERT do alerta no Postgres   (idempotente)
+   2. publica o evento no Kafka      (confirmado pelo broker)
+   3. salva o novo estado no Redis   (POR ÚLTIMO)
+```
+
+Uma queda em qualquer ponto reentrega o lote com o estado **antigo** ainda no Redis. A reavaliação produz as mesmas
+transições nos mesmos instantes: o INSERT vira no-op e o evento é republicado (duplicata inofensiva). Se o estado fosse
+salvo antes, uma queda entre "salvar estado" e "publicar" **perderia o alerta para sempre** (o estado diria "já
+disparou"). Cada ponto de queda tem teste: depois de persistir e publicar mas antes do estado, e depois de persistir
+mas antes de publicar; nos dois casos o resultado é 1 alerta e o evento sai na reentrega.
+
+### D5.3: Quatro camadas contra alerta duplicado
+
+| Camada | Cobre | Como |
+|---|---|---|
+| Máquina de estado (`Pending`/`Firing`) | 1000 leituras acima do limite | Em `Firing`, leitura violando não gera evento algum |
+| **Id determinístico** do alerta | Reprocessamento do mesmo disparo | `hash(regra, instante)`: o `INSERT` colide na PK e vira no-op |
+| **Índice único parcial** no banco | Estado do Redis perdido (flush/failover) | `UNIQUE(rule_id) WHERE status <> 'Resolved'`: no máximo 1 alerta **aberto** por regra, garantido pelo banco |
+| Guarda de tempo de evento no estado | Reentrega e dado fora de ordem | Leitura com timestamp `<=` ao último avaliado é ignorada |
+
+Testado: 12 disparos concorrentes da mesma regra resultam em exatamente 1 alerta; com o Redis zerado, a regra "dispara de
+novo" e o índice barra. O **evento** é o único ponto at-least-once; quem consome deduplica por `(AlertId, Kind)`.
+
+### D5.4: Estado das regras no Redis, sem lock
+
+O estado (máquina de estado + janela deslizante por baldes, os "contadores de janela") vive em JSON no Redis, uma chave por
+regra. Não há lock distribuído: o Kafka entrega as leituras de um sensor em ordem a **um único** consumer do grupo, então
+cada regra tem um único escritor por vez. Ler (um `MGET`) e escrever (pipeline) o estado de N regras custa 1 round trip cada.
+Sensor sem regra custa ~zero: o lote é agrupado por sensor e quem não tem regra é descartado sem tocar o Redis (testado).
+
+### D5.5: Catálogo de regras em cache (consistência eventual de 10 s)
+
+O motor consulta as regras a cada lote; ir ao banco a cada lote seria o gargalo. O `CachedRuleCatalog` mantém um
+snapshot em memória por `RuleCacheSeconds` (10 s). Preço: uma regra criada ou desabilitada leva até 10 s para valer.
+Desabilitar apaga o estado (ao reabilitar, a regra recomeça limpa).
+
+### D5.6: "Sem dados": a varredura é por relógio, e o relógio é perigoso
+
+Ausência de leitura não gera evento, então um `NoDataSweeper` pergunta a cada 15 s "há quanto tempo este sensor está mudo?".
+Cuidados, cada um nascido de um cenário real:
+
+1. **Só a varredura dispara; uma leitura só resolve.** Se uma leitura pudesse disparar, reprocessar um backlog antigo faria
+   um sensor saudável parecer mudo (a leitura tem horas de idade em relação ao relógio). Bug real, ver abaixo.
+2. **Instantes determinísticos.** O disparo usa `última leitura + duração` e a resolução usa o timestamp do dado que voltou,
+   nunca o "agora". Com `now`, cada replay geraria outro Id e outro alerta (D5.3).
+3. **Não declara silêncio enquanto o motor está atrasado.** Se o consumer está 10 minutos atrás no fluxo, "o sensor está
+   calado" pode ser só efeito do atraso. O motor mede o atraso (agora menos quando a API ingeriu o dado mais novo do lote) e a
+   varredura se abstém acima de 30 s. Com o fluxo ocioso não há atraso a esconder, e o silêncio é real (testado).
+4. **A última leitura vem do estado da própria regra**, não do grupo `lastvalue`: assim o "sem dados" não depende de outro
+   consumer estar em dia.
+5. **Um lease no Redis** (`SET NX PX`, liberação por token via Lua) garante que só UMA instância varre por vez. O lease
+   expira sozinho se o dono morrer, e o dono antigo nunca solta o lock do novo (testado).
+
+### D5.7: Eventos de alerta
+
+Tópico `sensorhub.alerts`, chave `sensorId` (eventos de um sensor em ordem: um `Resolved` nunca chega antes do `Fired`),
+producer idempotente com `acks=all`, corpo versionado e header `event-kind`.
+
+### D5.8: API de administração: Repository + Unit of Work, sem regra de negócio no controller
+
+`SensorService`, `AlertRuleService` e `AlertService` na Application; repositórios e `IUnitOfWork` (o `DbContext` do escopo) na
+Infrastructure. Regras de domínio violadas viram **400**; recurso inexistente **404**; conflito de estado (reconhecer alerta já
+reconhecido ou resolvido, id de sensor duplicado) **409**. Enums trafegam e são gravados como **texto**. O cadastro de sensor
+aceita um `id` opcional para preservar a identidade de uma frota existente (o simulador depende disso: as leituras já
+publicadas apontam para esses ids). Alertas não têm chave estrangeira para a regra: o histórico sobrevive à exclusão dela.
+
+### Resultados medidos (ambiente real: API + Worker com os 3 papéis, Kafka, Timescale e Redis em containers)
+
+| Cenário | Resultado |
+|---|---|
+| Motor recém-criado reprocessando ~3 milhões de leituras históricas | lag 0 em ~15 s; **27 alertas** (picos reais do simulador) e **0 alertas "sem dados" falsos** |
+| 300 sensores cadastrados com 2 regras cada (600 regras); 10% deles morrem aos 15 s | **exatamente 30** alertas "sem dados", ~10 s depois da morte |
+| Fim da carga (todos os sensores ficam mudos) | os outros 270 disparam pela mesma varredura; total 300 abertos |
+| Consistência entre banco e Kafka | 347 alertas + 47 resoluções = **394 eventos**; soma dos offsets de `sensorhub.alerts` = **394** |
+| Duplicatas | **0** regras com mais de 1 alerta aberto |
+| Lag dos grupos `persistence`, `lastvalue`, `alerts` | **0** nos três |
+
+### Bugs encontrados
+
+**1. Falso alerta "sem dados" ao reprocessar backlog (achado no desenho do motor, antes de existir o replay).**
+*Cenário:* o consumer fica parado 1 h e volta; lê leituras de 1 h atrás. *Causa raiz:* a regra `NoData` avaliava
+`agora - timestamp_da_leitura >= duração` também no caminho de leitura, então TODA leitura antiga parecia "silêncio" e
+disparava. *Correção:* no caminho de leitura, `NoData` só pode **resolver**; quem dispara é a varredura por relógio. Coberto
+por teste de domínio e por teste do motor, e confirmado no replay real (0 falsos em ~3 milhões de leituras).
+
+**2. Instante de disparo do "sem dados" dependia do relógio (achado na revisão do at-least-once).**
+*Causa raiz:* o alerta era criado no instante `now` da varredura; após uma queda, a reavaliação usava outro `now`, gerando outro
+`Id` determinístico e portanto **outro alerta**. *Correção:* o instante passou a ser um fato observável (`última leitura +
+duração` no disparo; timestamp do dado que voltou na resolução). Teste: duas varreduras em momentos diferentes veem o mesmo
+instante e o mesmo Id.
+
+**3. `HTTP 500` em toda chamada de regra (achado pelos testes de integração).**
+*Causa raiz:* `AlertRuleService` depende de `IRuleStateStore` (para apagar o estado ao desabilitar/excluir a regra), mas ele só
+estava registrado no host do Worker; o contêiner de DI da API não conseguia construir o serviço. *Correção:* o estado das
+regras é registrado junto com o Redis (`AddRedisState`), que a API também usa.
+
+**4. Teste "retoma do offset commitado" instável (design de teste).**
+Parava o consumer assim que o handler terminava, **antes** do commit (que vem depois). Isso é permitido em at-least-once (o lote
+seria reentregue), mas invalida a asserção "não relê nada". O teste passou a esperar o lag chegar a 0.
