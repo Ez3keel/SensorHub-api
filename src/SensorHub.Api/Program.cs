@@ -1,4 +1,5 @@
 using SensorHub.Api.Infrastructure;
+using SensorHub.Api.Realtime;
 using SensorHub.Application;
 using SensorHub.Infrastructure;
 using SensorHub.Infrastructure.Kafka;
@@ -21,6 +22,7 @@ builder.Services.AddPostgresPersistence(builder.Configuration);
 builder.Services.AddReadingQueries();
 builder.Services.AddManagementRepositories();
 builder.Services.AddManagementServices();
+builder.Services.AddRealtime(builder.Configuration);
 builder.Services.AddRedisState(builder.Configuration);
 
 builder.Services.AddHealthChecks()
@@ -37,7 +39,10 @@ if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 }
 
+app.UseCors(RealtimeExtensions.CorsPolicy);
+
 app.MapControllers();
+app.MapHub<TelemetryHub>("/hubs/telemetry");
 
 // liveness: o processo está de pé. readiness: as dependências respondem.
 app.MapHealthChecks("/health/live", new() { Predicate = _ => false });
