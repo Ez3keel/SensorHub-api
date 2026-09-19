@@ -66,6 +66,7 @@ public sealed class PlatformFixture : IAsyncLifetime
             BootstrapServers = BootstrapServers,
             ReadingsTopic = $"readings-{id}",
             ReadingsDlqTopic = $"readings-{id}.dlq",
+            AlertsTopic = $"alerts-{id}",
             ReadingsPartitions = partitions
         };
 
@@ -73,10 +74,13 @@ public sealed class PlatformFixture : IAsyncLifetime
         await admin.CreateTopicsAsync(
         [
             new TopicSpecification { Name = options.ReadingsTopic, NumPartitions = partitions, ReplicationFactor = 1 },
-            new TopicSpecification { Name = options.ReadingsDlqTopic, NumPartitions = 1, ReplicationFactor = 1 }
+            new TopicSpecification { Name = options.ReadingsDlqTopic, NumPartitions = 1, ReplicationFactor = 1 },
+            new TopicSpecification { Name = options.AlertsTopic, NumPartitions = 3, ReplicationFactor = 1 }
         ]);
         return options;
     }
+
+    public Microsoft.EntityFrameworkCore.IDbContextFactory<SensorHubDbContext> ContextFactory => new TestDbContextFactory(DataSource);
 
     public SensorHub.Infrastructure.Redis.RedisLastValueStore CreateLastValueStore(int ttlDays = 7) =>
         new(Redis, Microsoft.Extensions.Options.Options.Create(new SensorHub.Infrastructure.Redis.RedisOptions { KeyPrefix = "test:", LastValueTtlDays = ttlDays }));
@@ -90,6 +94,12 @@ public sealed class PlatformFixture : IAsyncLifetime
         command.Parameters.AddWithValue("ids", sensors.ToArray());
         return (long)(await command.ExecuteScalarAsync())!;
     }
+}
+
+internal sealed class TestDbContextFactory(NpgsqlDataSource dataSource) : IDbContextFactory<SensorHubDbContext>
+{
+    public SensorHubDbContext CreateDbContext() =>
+        new(new DbContextOptionsBuilder<SensorHubDbContext>().UseNpgsql(dataSource).Options);
 }
 
 [CollectionDefinition(Name)]

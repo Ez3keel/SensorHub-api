@@ -124,7 +124,12 @@ public class BatchConsumerTests(PlatformFixture platform)
 
         var first = new RecordingHandler();
         await using (var run1 = await StartAsync(kafka, first, group))
+        {
             await EventuallyAsync(() => Task.FromResult(first.Processed.Count == 1000), "primeira leva");
+            // O commit do offset acontece DEPOIS do handler. Parar antes dele é permitido (at-least-once: o lote seria
+            // reentregue), mas então o "sem reprocessar" deste teste não se aplica. Espera o commit chegar ao broker.
+            await EventuallyAsync(() => Task.FromResult(GetLag(kafka.BootstrapServers, kafka.ReadingsTopic, group) == 0), "offsets commitados");
+        }
 
         // consumer parado; chegam mais 500 (timestamps novos) enquanto ele está fora
         await PublishAsync(kafka, Readings(sensors, 500).Select(m => m with { Timestamp = m.Timestamp.AddDays(1) }).ToList());
