@@ -13,6 +13,7 @@ public sealed class SensorHubDbContext(DbContextOptions<SensorHubDbContext> opti
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
+        modelBuilder.ApplyConfigurationsFromAssembly(typeof(SensorHubDbContext).Assembly);
     }
 }
 
