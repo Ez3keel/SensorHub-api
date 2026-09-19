@@ -23,7 +23,8 @@ catch (Exception ex) when (ex is ArgumentException or FormatException)
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-var fleet = new SensorFleet(settings.Sensors);
+// A frota inteira é UM gateway: uma chave de API por dispositivo e todos os sensores pertencem a ele.
+var fleet = new SensorFleet(settings.Sensors, sensorsPerDevice: settings.Sensors);
 var factory = new ReadingFactory(fleet, new ReadingFactoryOptions(settings.DuplicateProbability, settings.HotSensorFactor));
 
 using var httpClient = new HttpClient(new SocketsHttpHandler
@@ -40,10 +41,18 @@ if (settings.Mode == "register")
 {
     var rules = settings.Rules.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
         .Select(r => r.ToLowerInvariant()).ToHashSet();
-    var registration = await new FleetRegistrar(httpClient).RegisterAsync(
+    AdminCredentials? admin = settings.AdminEmail.Length > 0 ? new(settings.AdminEmail, settings.AdminPassword) : null;
+    var registration = await new FleetRegistrar(httpClient, admin).RegisterAsync(
         fleet, rules.Contains("threshold"), rules.Contains("nodata"), settings.NoDataSeconds, cancellationToken: cts.Token);
-    Console.WriteLine($"Cadastro: {registration.SensorsCreated} sensores criados, {registration.SensorsAlreadyExisted} já existiam, " +
-                      $"{registration.RulesCreated} regras criadas, {registration.Failures} falhas.");
+    Console.WriteLine($"Cadastro: {registration.DevicesCreated} dispositivo(s) criado(s), {registration.SensorsCreated} sensores criados, " +
+                      $"{registration.SensorsAlreadyExisted} já existiam, {registration.RulesCreated} regras criadas, {registration.Failures} falhas.");
+    foreach (var (deviceId, key) in registration.ApiKeys ?? new Dictionary<Guid, string>())
+    {
+        if (settings.KeyOut.Length > 0) { await File.WriteAllTextAsync(settings.KeyOut, key, cts.Token); Console.WriteLine($"Chave de API do dispositivo {deviceId} gravada em {settings.KeyOut}."); }
+        else Console.WriteLine($"Chave de API do dispositivo {deviceId} (exibida só agora): {key}");
+    }
+    if (registration.DevicesAlreadyExisted > 0)
+        Console.WriteLine("Dispositivo já existia: a chave original não é recuperável. Use a que você guardou ou rotacione em POST /api/devices/{id}/rotate-key.");
     return registration.Failures > 0 ? 1 : 0;
 }
 

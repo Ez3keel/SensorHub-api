@@ -49,20 +49,57 @@ public class FleetRegistrarTests
         var report = await new FleetRegistrar(new HttpClient(handler) { BaseAddress = new Uri("http://api/") })
             .RegisterAsync(new SensorFleet(3), true, false, 20);
 
-        Assert.Equal(3, report.Failures);
+        Assert.Equal(1, report.Failures);     // o dispositivo não pôde ser criado...
+        Assert.Equal(0, report.SensorsCreated);
     }
 
-    private sealed class Stub(Func<string, HttpStatusCode> respond) : HttpMessageHandler
+    [Fact]
+    public async Task Creates_the_device_first_returns_its_key_and_logs_in_as_admin_when_credentials_are_given()
+    {
+        var handler = new Stub(_ => HttpStatusCode.Created, bodyFor: url =>
+            url.EndsWith("api/auth/login") ? """{"accessToken":"tok-123"}""" :
+            url.EndsWith("api/devices") ? """{"device":{},"apiKey":"shk_abc"}""" : "{}");
+        var fleet = new SensorFleet(6, sensorsPerDevice: 6);
+
+        var report = await new FleetRegistrar(new HttpClient(handler) { BaseAddress = new Uri("http://api/") }, new AdminCredentials("a@b.c", "senha"))
+            .RegisterAsync(fleet, false, false, 20);
+
+        Assert.Equal(1, report.DevicesCreated);
+        Assert.Equal("shk_abc", report.ApiKeys![fleet.Sensors[0].DeviceId]);
+        Assert.Equal(6, report.SensorsCreated);
+
+        var order = handler.Bodies.Select(b => b.Url).ToList();
+        Assert.EndsWith("api/auth/login", order[0]);
+        Assert.EndsWith("api/devices", order[1]);                                  // dispositivo ANTES dos sensores
+        Assert.All(handler.Auth.Skip(1), a => Assert.Equal("Bearer tok-123", a)); // o token é usado nas chamadas seguintes
+    }
+
+    [Fact]
+    public async Task An_existing_device_is_not_an_error_but_has_no_recoverable_key()
+    {
+        var handler = new Stub(url => url.EndsWith("api/devices") ? HttpStatusCode.Conflict : HttpStatusCode.Created);
+
+        var report = await new FleetRegistrar(new HttpClient(handler) { BaseAddress = new Uri("http://api/") })
+            .RegisterAsync(new SensorFleet(4), false, false, 20);
+
+        Assert.Equal(1, report.DevicesAlreadyExisted);
+        Assert.Empty(report.ApiKeys!);
+        Assert.Equal(0, report.Failures);
+    }
+
+    private sealed class Stub(Func<string, HttpStatusCode> respond, Func<string, string>? bodyFor = null) : HttpMessageHandler
     {
         private readonly List<(string Url, string Body)> _bodies = [];
+        private readonly List<string> _auth = [];
+        public IReadOnlyList<string> Auth { get { lock (_bodies) return _auth.ToList(); } }
         public IReadOnlyList<(string Url, string Body)> Bodies { get { lock (_bodies) return _bodies.ToList(); } }
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var url = request.RequestUri!.ToString();
             var body = request.Content is null ? "" : await request.Content.ReadAsStringAsync(cancellationToken);
-            lock (_bodies) _bodies.Add((url, body));
-            return new HttpResponseMessage(respond(url));
+            lock (_bodies) { _bodies.Add((url, body)); _auth.Add(request.Headers.Authorization?.ToString() ?? ""); }
+            return new HttpResponseMessage(respond(url)) { Content = new StringContent(bodyFor?.Invoke(url) ?? "{}") };
         }
     }
 }

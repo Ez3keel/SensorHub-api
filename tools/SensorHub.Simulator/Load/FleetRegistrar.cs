@@ -4,13 +4,20 @@ using SensorHub.Domain.Sensors;
 
 namespace SensorHub.Simulator.Load;
 
-public sealed record RegistrationReport(int SensorsCreated, int SensorsAlreadyExisted, int RulesCreated, int Failures);
+public sealed record RegistrationReport(
+    int SensorsCreated, int SensorsAlreadyExisted, int RulesCreated, int Failures,
+    int DevicesCreated = 0, int DevicesAlreadyExisted = 0, IReadOnlyDictionary<Guid, string>? ApiKeys = null);
+
+/// <summary>Credenciais de administrador para a API de administração (com a segurança ligada).</summary>
+public sealed record AdminCredentials(string Email, string Password);
 
 /// <summary>
 /// Cadastra a frota sintética na API de administração com os MESMOS ids que o simulador usa nas leituras
 /// (por isso o cadastro aceita um id explícito). É idempotente: rodar de novo pula o que já existe (409).
+/// Cria primeiro os dispositivos (cada sensor pertence a um) e devolve as chaves de API geradas: a chave só existe
+/// em texto puro na resposta da criação, então um dispositivo que já existia (409) não tem chave a devolver.
 /// </summary>
-public sealed class FleetRegistrar(HttpClient http)
+public sealed class FleetRegistrar(HttpClient http, AdminCredentials? admin = null)
 {
     /// <summary>Limite de "alta" por métrica, acima do qual o sinal sintético só chega com os picos raros do gerador.</summary>
     private static double HighLimit(MetricType metric) => metric switch
@@ -26,6 +33,12 @@ public sealed class FleetRegistrar(HttpClient http)
         SensorFleet fleet, bool thresholdRules, bool noDataRules, int noDataSeconds, int parallelism = 8, CancellationToken cancellationToken = default)
     {
         int created = 0, existed = 0, rules = 0, failures = 0;
+
+        if (admin is not null) await LoginAsync(admin, cancellationToken);
+
+        var (devicesCreated, devicesExisted, keys, deviceFailures) = await EnsureDevicesAsync(fleet, cancellationToken);
+        if (deviceFailures > 0) // sem dispositivo, todo cadastro de sensor falharia com 404: melhor parar e dizer o motivo
+            return new RegistrationReport(0, 0, 0, deviceFailures, devicesCreated, devicesExisted, keys);
 
         await Parallel.ForEachAsync(fleet.Sensors, new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = cancellationToken },
             async (sensor, ct) =>
@@ -49,7 +62,49 @@ public sealed class FleetRegistrar(HttpClient http)
                 else if (noDataRules) Interlocked.Increment(ref failures);
             });
 
-        return new RegistrationReport(created, existed, rules, failures);
+        return new RegistrationReport(created, existed, rules, failures, devicesCreated, devicesExisted, keys);
+    }
+
+    private async Task LoginAsync(AdminCredentials credentials, CancellationToken ct)
+    {
+        var response = await http.PostAsJsonAsync("api/auth/login", new { email = credentials.Email, password = credentials.Password }, ct);
+        if (!response.IsSuccessStatusCode)
+            throw new HttpRequestException($"Login de administrador falhou ({(int)response.StatusCode}).", null, response.StatusCode);
+
+        using var doc = await System.Text.Json.JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+        var token = doc.RootElement.GetProperty("accessToken").GetString();
+        http.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+    }
+
+    private async Task<(int Created, int Existed, Dictionary<Guid, string> Keys, int Failures)> EnsureDevicesAsync(SensorFleet fleet, CancellationToken ct)
+    {
+        int created = 0, existed = 0, failures = 0;
+        var keys = new Dictionary<Guid, string>();
+
+        foreach (var deviceId in fleet.Sensors.Select(s => s.DeviceId).Distinct())
+        {
+            var response = await http.PostAsJsonAsync("api/devices", new { id = deviceId, name = $"sim-{deviceId.ToString("N")[..8]}" }, ct);
+            if (response.StatusCode == HttpStatusCode.Created)
+            {
+                created++;
+                var key = await TryReadKeyAsync(response, ct);
+                if (key is not null) keys[deviceId] = key;
+            }
+            else if (response.StatusCode == HttpStatusCode.Conflict) existed++;
+            else failures++;
+        }
+
+        return (created, existed, keys, failures);
+    }
+
+    private static async Task<string?> TryReadKeyAsync(HttpResponseMessage response, CancellationToken ct)
+    {
+        try
+        {
+            using var doc = await System.Text.Json.JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            return doc.RootElement.TryGetProperty("apiKey", out var key) ? key.GetString() : null;
+        }
+        catch (System.Text.Json.JsonException) { return null; }
     }
 
     private async Task<bool> PostRuleAsync(Guid sensorId, string name, string type, string comparison, double threshold, int durationSeconds, CancellationToken ct)

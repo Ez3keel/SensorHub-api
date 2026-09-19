@@ -17,7 +17,10 @@ public sealed record SimulatorSettings(
     string Rules,
     int NoDataSeconds,
     int SilenceAfterSeconds,
-    double SilenceFraction)
+    double SilenceFraction,
+    string AdminEmail = "",
+    string AdminPassword = "",
+    string KeyOut = "")
 {
     public static SimulatorSettings Parse(string[] args)
     {
@@ -49,10 +52,14 @@ public sealed record SimulatorSettings(
             Rules: Get("rules", ""),
             NoDataSeconds: GetInt("nodata-seconds", 20),
             SilenceAfterSeconds: GetInt("silence-after", 0),
-            SilenceFraction: GetDouble("silence-fraction", 0));
+            SilenceFraction: GetDouble("silence-fraction", 0),
+            AdminEmail: Get("admin-email", ""),
+            // a senha também pode vir do ambiente: argumentos de linha de comando ficam no histórico do shell
+            AdminPassword: Get("admin-password", Environment.GetEnvironmentVariable("SENSORHUB_ADMIN_PASSWORD") ?? ""),
+            KeyOut: Get("key-out", ""));
 
         var unknown = map.Keys.Except(
-            ["mode", "sensors", "rate", "duration", "batch", "workers", "duplicates", "hot", "url", "api-key", "rules", "nodata-seconds", "silence-after", "silence-fraction"],
+            ["mode", "sensors", "rate", "duration", "batch", "workers", "duplicates", "hot", "url", "api-key", "rules", "nodata-seconds", "silence-after", "silence-fraction", "admin-email", "admin-password", "key-out"],
             StringComparer.OrdinalIgnoreCase).ToList();
         if (unknown.Count > 0)
             throw new ArgumentException($"Opção desconhecida: {string.Join(", ", unknown.Select(u => "--" + u))}");
@@ -73,7 +80,10 @@ public sealed record SimulatorSettings(
           --duplicates P          probabilidade [0,1] de reenviar leitura idêntica (padrão 0)
           --hot N                 o sensor #0 emite N vezes mais que os outros (padrão 1)
           --url URL               base da API no modo http (padrão http://localhost:5080)
-          --api-key KEY           chave de API do dispositivo (modo http)
+          --api-key KEY           chave de API do dispositivo (modo http; a frota inteira é um gateway/dispositivo)
+          --admin-email E         (register) administrador da API, se a segurança estiver ligada
+          --admin-password P      (register) senha (ou variável SENSORHUB_ADMIN_PASSWORD)
+          --key-out ARQUIVO       (register) grava aqui a chave de API criada para o dispositivo
           --rules LIST            (register) regras a criar por sensor: threshold,nodata
           --nodata-seconds N      (register) silêncio máximo da regra "sem dados" (padrão 20)
           --silence-after S       (http) depois de S segundos, parte da frota para de emitir
