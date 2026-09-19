@@ -1,4 +1,9 @@
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.RateLimiting;
+using SensorHub.Api.Security;
 using Microsoft.AspNetCore.Mvc;
+using SensorHub.Application.Security;
 using Microsoft.Extensions.Options;
 using SensorHub.Application.Ingestion;
 
@@ -10,8 +15,19 @@ namespace SensorHub.Api.Controllers;
 /// </summary>
 [ApiController]
 [Route("api/readings")]
-public sealed class ReadingsController(IngestionService ingestion, IOptions<IngestionOptions> options) : ControllerBase
+[Authorize(Policy = Policies.Device)]
+[EnableRateLimiting(Policies.IngestionLimiter)]
+public sealed class ReadingsController(
+    IngestionService ingestion, IOptions<IngestionOptions> options, IOptions<SecurityOptions> security) : ControllerBase
 {
+    /// <summary>
+    /// O dispositivo autenticado pela chave de API. Com a segurança desligada não há identidade, e a ingestão não checa propriedade.
+    /// </summary>
+    private DeviceIdentity? CurrentDevice() =>
+        security.Value.Enabled && Guid.TryParse(User.FindFirstValue(Policies.DeviceIdClaim), out var id)
+            ? new DeviceIdentity(id, User.FindFirstValue(Policies.DeviceNameClaim) ?? "")
+            : null;
+
     /// <summary>Ingere uma leitura.</summary>
     [HttpPost]
     [ProducesResponseType(StatusCodes.Status202Accepted)]
@@ -19,7 +35,7 @@ public sealed class ReadingsController(IngestionService ingestion, IOptions<Inge
     [ProducesResponseType(StatusCodes.Status503ServiceUnavailable)]
     public async Task<IActionResult> Post([FromBody] ReadingRequest request, CancellationToken cancellationToken)
     {
-        var result = await ingestion.IngestAsync([request], cancellationToken);
+        var result = await ingestion.IngestAsync([request], CurrentDevice(), cancellationToken);
 
         if (result.HasRejections)
         {
@@ -50,7 +66,7 @@ public sealed class ReadingsController(IngestionService ingestion, IOptions<Inge
         if (requests.Count > max)
             return BatchProblem($"O lote excede o máximo de {max} leituras.");
 
-        var result = await ingestion.IngestAsync(requests, cancellationToken);
+        var result = await ingestion.IngestAsync(requests, CurrentDevice(), cancellationToken);
         var response = new BatchResponse(result.Accepted, result.Rejected);
 
         // 202 se algo foi aceito; 422 se TUDO foi rejeitado (nada a reenviar sem corrigir).

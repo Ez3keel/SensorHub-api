@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
 using SensorHub.Application.Ingestion;
 using SensorHub.Application.Management;
+using SensorHub.Application.Security;
 using SensorHub.Domain.Common;
 using SensorHub.Application.Queries;
 
@@ -21,6 +22,13 @@ public sealed class GlobalExceptionHandler(ILogger<GlobalExceptionHandler> logge
             logger.LogWarning(exception, "Ingestão indisponível; devolvendo 503 ao cliente.");
             context.Response.Headers.RetryAfter = "1";
             await Write(context, StatusCodes.Status503ServiceUnavailable, "Serviço temporariamente indisponível", exception.Message, cancellationToken);
+            return true;
+        }
+
+        if (exception is AuthenticationFailedException auth)
+        {
+            context.Response.Headers.WWWAuthenticate = "Bearer";
+            await Write(context, StatusCodes.Status401Unauthorized, "Não autenticado", auth.Message, cancellationToken);
             return true;
         }
 

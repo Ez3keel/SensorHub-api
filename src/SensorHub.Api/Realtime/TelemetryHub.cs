@@ -1,4 +1,6 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
+using SensorHub.Api.Security;
 using Microsoft.Extensions.Options;
 using SensorHub.Application.Observability;
 using SensorHub.Application.Realtime;
@@ -34,6 +36,7 @@ public sealed class RealtimeOptions
 /// </list>
 /// Mensagens do servidor: <c>readings</c> (lista), <c>reading</c> (uma) e <c>alert</c>.
 /// </summary>
+[Authorize(Policy = Policies.Viewer)]
 public sealed class TelemetryHub(ISubscriptionRegistry registry, IOptions<RealtimeOptions> options) : Hub
 {
     private const string SensorsKey = "sensors";

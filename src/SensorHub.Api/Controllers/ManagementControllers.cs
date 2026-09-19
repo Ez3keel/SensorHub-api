@@ -1,3 +1,6 @@
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.RateLimiting;
+using SensorHub.Api.Security;
 using Microsoft.AspNetCore.Mvc;
 using SensorHub.Application.Management;
 using SensorHub.Domain.Alerts;
@@ -29,6 +32,8 @@ public sealed record AlertResponse(
 /// <summary>Cadastro de sensores (canais de medição).</summary>
 [ApiController]
 [Route("api/sensors")]
+[Authorize(Policy = Policies.Viewer)]
+[EnableRateLimiting(Policies.ApiLimiter)]
 public sealed class SensorsController(SensorService sensors) : ControllerBase
 {
     /// <param name="Id">Opcional: preserva a identidade de um sensor já existente (importação, simulador).</param>
@@ -36,6 +41,7 @@ public sealed class SensorsController(SensorService sensors) : ControllerBase
     public sealed record SetActiveRequest(bool Active);
 
     [HttpPost]
+    [Authorize(Policy = Policies.Admin)]
     [ProducesResponseType(typeof(SensorResponse), StatusCodes.Status201Created)]
     public async Task<IActionResult> Create([FromBody] CreateSensorRequest request, CancellationToken cancellationToken)
     {
@@ -54,6 +60,7 @@ public sealed class SensorsController(SensorService sensors) : ControllerBase
         Ok(SensorResponse.From(await sensors.GetAsync(id, cancellationToken)));
 
     [HttpPatch("{id:guid}/active")]
+    [Authorize(Policy = Policies.Admin)]
     public async Task<IActionResult> SetActive(Guid id, [FromBody] SetActiveRequest request, CancellationToken cancellationToken) =>
         Ok(SensorResponse.From(await sensors.SetActiveAsync(id, request.Active, cancellationToken)));
 }
@@ -61,6 +68,8 @@ public sealed class SensorsController(SensorService sensors) : ControllerBase
 /// <summary>Regras de alerta. Mudanças valem no motor em até <c>Alerting:RuleCacheSeconds</c> (cache de regras).</summary>
 [ApiController]
 [Route("api/alert-rules")]
+[Authorize(Policy = Policies.Viewer)]
+[EnableRateLimiting(Policies.ApiLimiter)]
 public sealed class AlertRulesController(AlertRuleService rules) : ControllerBase
 {
     public sealed record CreateRuleRequest(
@@ -70,6 +79,7 @@ public sealed class AlertRulesController(AlertRuleService rules) : ControllerBas
     public sealed record SetEnabledRequest(bool Enabled);
 
     [HttpPost]
+    [Authorize(Policy = Policies.Admin)]
     [ProducesResponseType(typeof(RuleResponse), StatusCodes.Status201Created)]
     public async Task<IActionResult> Create([FromBody] CreateRuleRequest r, CancellationToken cancellationToken)
     {
@@ -83,10 +93,12 @@ public sealed class AlertRulesController(AlertRuleService rules) : ControllerBas
         Ok((await rules.ListAsync(sensorId, cancellationToken)).Select(RuleResponse.From).ToList());
 
     [HttpPatch("{id:guid}/enabled")]
+    [Authorize(Policy = Policies.Admin)]
     public async Task<IActionResult> SetEnabled(Guid id, [FromBody] SetEnabledRequest request, CancellationToken cancellationToken) =>
         Ok(RuleResponse.From(await rules.SetEnabledAsync(id, request.Enabled, cancellationToken)));
 
     [HttpDelete("{id:guid}")]
+    [Authorize(Policy = Policies.Admin)]
     public async Task<IActionResult> Delete(Guid id, CancellationToken cancellationToken)
     {
         await rules.DeleteAsync(id, cancellationToken);
@@ -97,6 +109,8 @@ public sealed class AlertRulesController(AlertRuleService rules) : ControllerBas
 /// <summary>Alertas gerados pelo motor: consulta e reconhecimento.</summary>
 [ApiController]
 [Route("api/alerts")]
+[Authorize(Policy = Policies.Viewer)]
+[EnableRateLimiting(Policies.ApiLimiter)]
 public sealed class AlertsController(AlertService alerts) : ControllerBase
 {
     public sealed record AcknowledgeRequest(string User);
@@ -112,6 +126,7 @@ public sealed class AlertsController(AlertService alerts) : ControllerBase
         Ok(AlertResponse.From(await alerts.GetAsync(id, cancellationToken)));
 
     [HttpPost("{id:guid}/acknowledge")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<IActionResult> Acknowledge(Guid id, [FromBody] AcknowledgeRequest request, CancellationToken cancellationToken) =>
         Ok(AlertResponse.From(await alerts.AcknowledgeAsync(id, request.User, cancellationToken)));
 }

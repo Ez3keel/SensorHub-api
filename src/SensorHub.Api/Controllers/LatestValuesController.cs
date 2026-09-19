@@ -1,3 +1,6 @@
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.RateLimiting;
+using SensorHub.Api.Security;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
 using SensorHub.Application.LatestValues;
@@ -7,6 +10,8 @@ namespace SensorHub.Api.Controllers;
 /// <summary>Último valor conhecido de cada sensor: leitura O(1) no Redis, com cache-aside no banco.</summary>
 [ApiController]
 [Route("api/sensors")]
+[Authorize(Policy = Policies.Viewer)]
+[EnableRateLimiting(Policies.ApiLimiter)]
 public sealed class LatestValuesController(LastValueService lastValues, TimeProvider clock) : ControllerBase
 {
     public const int MaxIdsPerRequest = 200;

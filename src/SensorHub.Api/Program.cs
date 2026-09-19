@@ -2,6 +2,7 @@ using SensorHub.Api.Infrastructure;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Trace;
 using SensorHub.Api.Realtime;
+using SensorHub.Api.Security;
 using SensorHub.Infrastructure.Observability;
 using SensorHub.Application;
 using SensorHub.Infrastructure;
@@ -24,6 +25,10 @@ builder.Services.AddKafkaReadingPublisher();
 builder.Services.AddPostgresPersistence(builder.Configuration);
 builder.Services.AddReadingQueries();
 builder.Services.AddManagementRepositories();
+builder.Services.AddSecurityInfrastructure(builder.Configuration);
+builder.Services.AddSecurityServices();
+builder.Services.AddApiSecurity(builder.Configuration);
+builder.Services.AddHostedService<BootstrapAdminService>(); // depois do migrator (registrado por AddPostgresPersistence)
 builder.Services.AddManagementServices();
 builder.Services.AddRealtime(builder.Configuration);
 builder.Services.AddSensorHubObservability(builder.Configuration, "sensorhub-api",
@@ -40,6 +45,8 @@ builder.Services.AddHealthChecks()
 
 var app = builder.Build();
 
+app.Services.ValidateSecurityConfiguration(); // segredo do JWT fraco/ausente derruba a subida, não a primeira requisição
+
 app.UseExceptionHandler();
 
 if (app.Environment.IsDevelopment())
@@ -48,6 +55,11 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseCors(RealtimeExtensions.CorsPolicy);
+app.UseAuthentication();
+app.UseAuthorization();
+// Depois da autorização, de propósito: os esquemas são por política (JWT x chave de API), então a identidade do
+// dispositivo só existe em HttpContext.User depois que a política roda. Antes disso o limiter via "anônimo" e agrupava tudo por IP.
+app.UseRateLimiter();
 
 app.MapControllers();
 app.MapHub<TelemetryHub>("/hubs/telemetry");

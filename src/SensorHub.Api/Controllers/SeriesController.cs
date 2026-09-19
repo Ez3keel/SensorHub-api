@@ -1,3 +1,6 @@
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.RateLimiting;
+using SensorHub.Api.Security;
 using Microsoft.AspNetCore.Mvc;
 using SensorHub.Application.Queries;
 
@@ -6,6 +9,8 @@ namespace SensorHub.Api.Controllers;
 /// <summary>Consulta do histórico de um sensor: série agregada (para gráficos) e leituras brutas (para auditoria).</summary>
 [ApiController]
 [Route("api/sensors/{sensorId:guid}")]
+[Authorize(Policy = Policies.Viewer)]
+[EnableRateLimiting(Policies.ApiLimiter)]
 public sealed class SeriesController(ReadingQueryService queries) : ControllerBase
 {
     /// <summary>
