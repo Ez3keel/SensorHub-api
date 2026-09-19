@@ -7,7 +7,9 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Npgsql;
 using StackExchange.Redis;
+using SensorHub.Application.Alerting;
 using SensorHub.Application.Ingestion;
+using SensorHub.Application.Management;
 using SensorHub.Application.Processing;
 using SensorHub.Application.LatestValues;
 using SensorHub.Application.Queries;
@@ -43,11 +45,42 @@ public static class DependencyInjection
         services.AddSingleton(sp => NpgsqlDataSource.Create(
             sp.GetRequiredService<IConfiguration>().GetConnectionString(PersistenceOptions.ConnectionStringName)
             ?? throw new InvalidOperationException($"ConnectionStrings:{PersistenceOptions.ConnectionStringName} não configurada.")));
-        services.AddDbContext<SensorHubDbContext>((sp, options) => options.UseNpgsql(sp.GetRequiredService<NpgsqlDataSource>()));
+        // Factory (singleton) para o motor de alertas e o catálogo, que vivem em singletons e criam contextos curtos;
+        // e o DbContext por escopo para a API (repositórios e Unit of Work por requisição).
+        services.AddDbContextFactory<SensorHubDbContext>((sp, options) => options.UseNpgsql(sp.GetRequiredService<NpgsqlDataSource>()));
+        services.AddScoped(sp => sp.GetRequiredService<IDbContextFactory<SensorHubDbContext>>().CreateDbContext());
         services.AddSingleton<IReadingStore, PostgresReadingStore>();
         services.AddSingleton<IReadingQueries, TimescaleReadingQueries>();
         services.AddHostedService<DatabaseMigrator>();
         return services;
+    }
+
+    /// <summary>Repositórios e Unit of Work da API de administração (sensores, regras e alertas).</summary>
+    public static IServiceCollection AddManagementRepositories(this IServiceCollection services)
+    {
+        services.AddScoped<IUnitOfWork, EfUnitOfWork>();
+        services.AddScoped<ISensorRepository, SensorRepository>();
+        services.AddScoped<IAlertRuleRepository, AlertRuleRepository>();
+        services.AddScoped<IAlertRepository, AlertRepository>();
+        return services;
+    }
+
+    /// <summary>
+    /// O motor de alertas: consumer do grupo <c>sensorhub.alerts</c> + varredura "sem dados". Requer Postgres
+    /// (regras e alertas), Redis (estado das regras) e Kafka (eventos de alerta).
+    /// </summary>
+    public static IServiceCollection AddAlertEngine(this IServiceCollection services, IConfiguration configuration)
+    {
+        services.Configure<AlertingOptions>(configuration.GetSection(AlertingOptions.SectionName));
+        services.AddSingleton(TimeProvider.System);
+        services.AddSingleton<IRuleCatalog, CachedRuleCatalog>();
+        services.AddSingleton<IAlertStore, PostgresAlertStore>();
+        services.AddSingleton<KafkaAlertEventPublisher>();
+        services.AddSingleton<IAlertEventPublisher>(sp => sp.GetRequiredService<KafkaAlertEventPublisher>());
+        services.AddSingleton<IDistributedLease, RedisDistributedLease>();
+        services.AddSingleton<AlertEngine>();
+        services.AddHostedService<NoDataSweeper>();
+        return services.AddReadingConsumer<EvaluateAlertsHandler>(configuration, "alerts", isPoison: null);
     }
 
     /// <summary>Redis como estado quente: último valor por sensor (e, na Fase 5, estado das regras de alerta).</summary>
@@ -65,6 +98,7 @@ public static class DependencyInjection
         });
         services.AddSingleton<ILastValueStore, RedisLastValueStore>();
         services.AddSingleton<LastValueService>();
+        services.AddSingleton<IRuleStateStore, RedisRuleStateStore>(); // a API também precisa: limpa o estado ao desabilitar/excluir uma regra
         return services;
     }
 
