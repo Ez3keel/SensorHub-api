@@ -5,6 +5,7 @@ using SensorHub.Application.Ingestion;
 
 namespace SensorHub.Application.Tests.Ingestion;
 
+[Collection("telemetry")]
 public class IngestionServiceTests
 {
     private static readonly DateTimeOffset Now = new(2026, 6, 1, 12, 0, 0, TimeSpan.Zero);

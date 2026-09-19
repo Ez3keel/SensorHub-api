@@ -136,9 +136,15 @@ public class BatchConsumerTests(PlatformFixture platform)
         var second = new RecordingHandler();
         await using var run2 = await StartAsync(kafka, second, group);
 
-        await EventuallyAsync(() => Task.FromResult(second.Processed.Count == 500), "só as 500 novas");
+        // A PROPRIEDADE que importa: as 500 novas chegam e NADA da primeira leva é relido. Não se depende do tempo exato de
+        // entrada no grupo (a suíte roda com muitos containers disputando a mesma máquina), então a espera é generosa.
+        var firstWave = first.Processed.Select(r => r.Reading.Timestamp).ToHashSet();
+        await EventuallyAsync(() => Task.FromResult(second.Processed.Count(r => !firstWave.Contains(r.Reading.Timestamp)) >= 500),
+            "as 500 leituras novas chegam ao segundo consumer", TimeSpan.FromSeconds(120));
         await Task.Delay(500);
-        Assert.Equal(500, second.Processed.Count); // nada da primeira leva foi relido
+
+        Assert.DoesNotContain(second.Processed, r => firstWave.Contains(r.Reading.Timestamp)); // nada da primeira leva foi relido
+        Assert.Equal(500, second.Processed.Count);
     }
 
     // -------------------------------------------------------------- mensagens venenosas

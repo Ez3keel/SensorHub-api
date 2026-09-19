@@ -8,6 +8,7 @@ using SensorHub.Domain.Readings;
 
 namespace SensorHub.Application.Tests.Alerting;
 
+[Collection("telemetry")]
 public class AlertEngineTests
 {
     private static readonly DateTimeOffset T0 = new(2026, 6, 1, 12, 0, 0, TimeSpan.Zero);
