@@ -62,14 +62,30 @@ public interface IRuleStateStore
     Task DeleteAsync(Guid ruleId, CancellationToken cancellationToken);
 }
 
+public enum InsertOutcome
+{
+    /// <summary>Alerta novo, criado agora.</summary>
+    Created = 1,
+
+    /// <summary>Já existia com o MESMO Id: é a reprocessamento do mesmo disparo (o evento ainda deve ser publicado).</summary>
+    AlreadyExists = 2,
+
+    /// <summary>A regra já tem outro alerta ABERTO (Id diferente): disparo duplicado, ignorado. No máximo 1 alerta aberto por regra.</summary>
+    OpenAlertExists = 3
+}
+
 public interface IAlertStore
 {
-    /// <summary>Insere o alerta disparado. Idempotente: o Id é determinístico, então reinserir é no-op. Retorna true se foi criado agora.</summary>
-    Task<bool> InsertFiredAsync(Alert alert, CancellationToken cancellationToken);
+    /// <summary>
+    /// Insere o alerta disparado. Idempotente por dois mecanismos: o Id determinístico (reprocessamento do mesmo
+    /// disparo) e um índice único parcial "1 alerta aberto por regra" (disparo duplicado com Id diferente).
+    /// </summary>
+    Task<InsertOutcome> InsertFiredAsync(Alert alert, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Resolve o alerta ABERTO (Firing/Acknowledged) da regra, se houver. Idempotente. Retorna o alerta resolvido
-    /// (para o evento) ou null se não havia alerta aberto.
+    /// Resolve o alerta ABERTO (Firing/Acknowledged) da regra. Idempotente: se o alerta já foi resolvido NO MESMO
+    /// instante <paramref name="at"/> (reprocessamento), devolve-o de novo para que o evento ainda seja publicado.
+    /// Retorna null se não havia alerta aberto nem resolvido neste instante.
     /// </summary>
     Task<Alert?> ResolveOpenAsync(Guid ruleId, DateTimeOffset at, double? value, CancellationToken cancellationToken);
 }
