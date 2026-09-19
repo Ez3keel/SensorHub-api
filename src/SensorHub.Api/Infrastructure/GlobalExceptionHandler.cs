@@ -1,6 +1,8 @@
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
 using SensorHub.Application.Ingestion;
+using SensorHub.Application.Management;
+using SensorHub.Domain.Common;
 using SensorHub.Application.Queries;
 
 namespace SensorHub.Api.Infrastructure;
@@ -19,6 +21,24 @@ public sealed class GlobalExceptionHandler(ILogger<GlobalExceptionHandler> logge
             logger.LogWarning(exception, "Ingestão indisponível; devolvendo 503 ao cliente.");
             context.Response.Headers.RetryAfter = "1";
             await Write(context, StatusCodes.Status503ServiceUnavailable, "Serviço temporariamente indisponível", exception.Message, cancellationToken);
+            return true;
+        }
+
+        if (exception is NotFoundException notFound)
+        {
+            await Write(context, StatusCodes.Status404NotFound, "Não encontrado", notFound.Message, cancellationToken);
+            return true;
+        }
+
+        if (exception is ConflictException conflict)
+        {
+            await Write(context, StatusCodes.Status409Conflict, "Conflito", conflict.Message, cancellationToken);
+            return true;
+        }
+
+        if (exception is DomainException domain)
+        {
+            await Write(context, StatusCodes.Status400BadRequest, "Dado inválido", domain.Message, cancellationToken);
             return true;
         }
 

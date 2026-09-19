@@ -7,7 +7,9 @@ using SensorHub.Infrastructure.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddControllers();
+builder.Services.AddControllers().AddJsonOptions(options =>
+    // enums como texto ("Temperature", "GreaterThan"): legível e estável (não quebra se a ordem do enum mudar)
+    options.JsonSerializerOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter()));
 builder.Services.AddOpenApi();
 builder.Services.AddProblemDetails();
 builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
@@ -17,6 +19,8 @@ builder.Services.AddKafkaMessaging(builder.Configuration);
 builder.Services.AddKafkaReadingPublisher();
 builder.Services.AddPostgresPersistence(builder.Configuration);
 builder.Services.AddReadingQueries();
+builder.Services.AddManagementRepositories();
+builder.Services.AddManagementServices();
 builder.Services.AddRedisState(builder.Configuration);
 
 builder.Services.AddHealthChecks()
