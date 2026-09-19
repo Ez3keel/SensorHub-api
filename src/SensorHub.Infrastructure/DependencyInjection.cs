@@ -14,7 +14,9 @@ using SensorHub.Application.Processing;
 using SensorHub.Application.LatestValues;
 using SensorHub.Application.Queries;
 using SensorHub.Infrastructure.Kafka;
+using SensorHub.Application.Security;
 using SensorHub.Infrastructure.Persistence;
+using SensorHub.Infrastructure.Security;
 using SensorHub.Infrastructure.Redis;
 
 namespace SensorHub.Infrastructure;
@@ -81,6 +83,24 @@ public static class DependencyInjection
         services.AddSingleton<AlertEngine>();
         services.AddHostedService<NoDataSweeper>();
         return services.AddReadingConsumer<EvaluateAlertsHandler>(configuration, "alerts", isPoison: null);
+    }
+
+    /// <summary>
+    /// Segurança: hash de senha, emissão de JWT, autenticação de dispositivo por chave de API (com cache) e o registro de sensores
+    /// usado para validar a propriedade das leituras. Repositórios de usuário/token/dispositivo por escopo de requisição.
+    /// </summary>
+    public static IServiceCollection AddSecurityInfrastructure(this IServiceCollection services, IConfiguration configuration)
+    {
+        services.Configure<SecurityOptions>(configuration.GetSection(SecurityOptions.SectionName));
+        services.AddMemoryCache();
+        services.AddSingleton<IPasswordHasher, IdentityPasswordHasher>();
+        services.AddSingleton<IAccessTokenIssuer, JwtAccessTokenIssuer>();
+        services.AddSingleton<IDeviceAuthenticator, CachedDeviceAuthenticator>();
+        services.AddSingleton<ISensorRegistry, CachedSensorRegistry>();
+        services.AddScoped<IUserRepository, UserRepository>();
+        services.AddScoped<IRefreshTokenRepository, RefreshTokenRepository>();
+        services.AddScoped<IDeviceRepository, DeviceRepository>();
+        return services;
     }
 
     /// <summary>Redis como estado quente: último valor por sensor (e, na Fase 5, estado das regras de alerta).</summary>
