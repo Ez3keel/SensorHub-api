@@ -21,7 +21,7 @@ internal static class AlertTestData
     public static async Task<Sensor> SaveSensorAsync(PlatformFixture platform, string group = "g1")
     {
         await using var db = platform.ContextFactory.CreateDbContext();
-        var sensor = Sensor.Create(Guid.NewGuid(), $"sensor-{Guid.NewGuid():N}"[..20], MetricType.Temperature, "°C", group, T0);
+        var sensor = Sensor.Create(platform.SharedDeviceId, $"sensor-{Guid.NewGuid():N}"[..20], MetricType.Temperature, "°C", group, T0);
         db.Set<Sensor>().Add(sensor);
         await db.SaveChangesAsync();
         return sensor;

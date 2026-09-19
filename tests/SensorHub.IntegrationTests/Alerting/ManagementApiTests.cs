@@ -21,7 +21,7 @@ public class ManagementApiTests(PlatformFixture platform)
     private async Task<Guid> CreateSensorAsync(string group = "planta-x", string metric = "Temperature")
     {
         var response = await _http.PostAsJsonAsync("/api/sensors",
-            new { deviceId = Guid.NewGuid(), name = $"forno-{Guid.NewGuid():N}"[..16], metric, unit = "°C", group });
+            new { deviceId = platform.SharedDeviceId, name = $"forno-{Guid.NewGuid():N}"[..16], metric, unit = "°C", group });
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         return (await ReadAsync(response)).GetProperty("id").GetGuid();
     }
@@ -32,7 +32,7 @@ public class ManagementApiTests(PlatformFixture platform)
     public async Task Sensor_is_created_returned_by_id_and_serialized_with_enum_names()
     {
         var response = await _http.PostAsJsonAsync("/api/sensors",
-            new { deviceId = Guid.NewGuid(), name = "  Forno 1  ", metric = "Vibration", unit = "mm/s", group = "fabrica-1" });
+            new { deviceId = platform.SharedDeviceId, name = "  Forno 1  ", metric = "Vibration", unit = "mm/s", group = "fabrica-1" });
 
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         var created = await ReadAsync(response);
@@ -49,7 +49,7 @@ public class ManagementApiTests(PlatformFixture platform)
     public async Task Sensor_can_be_created_with_an_explicit_id_and_a_duplicate_id_is_a_409()
     {
         var id = Guid.NewGuid();
-        var body = new { id, deviceId = Guid.NewGuid(), name = "importado", metric = "Pressure", unit = "hPa", group = "g" };
+        var body = new { id, deviceId = platform.SharedDeviceId, name = "importado", metric = "Pressure", unit = "hPa", group = "g" };
 
         var first = await _http.PostAsJsonAsync("/api/sensors", body);
         var duplicate = await _http.PostAsJsonAsync("/api/sensors", body);
@@ -59,6 +59,15 @@ public class ManagementApiTests(PlatformFixture platform)
         Assert.Equal(HttpStatusCode.Conflict, duplicate.StatusCode);
     }
 
+    [Fact]
+    public async Task A_sensor_needs_an_existing_device()
+    {
+        var response = await _http.PostAsJsonAsync("/api/sensors",
+            new { deviceId = Guid.NewGuid(), name = "orfao", metric = "Temperature", unit = "°C", group = "g" });
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode); // sensor sem dono não existe
+    }
+
     [Theory]
     [InlineData("", "°C", "g")]
     [InlineData("nome", "", "g")]
@@ -66,7 +75,7 @@ public class ManagementApiTests(PlatformFixture platform)
     public async Task Invalid_sensor_data_is_a_400_with_the_domain_message(string name, string unit, string group)
     {
         var response = await _http.PostAsJsonAsync("/api/sensors",
-            new { deviceId = Guid.NewGuid(), name, metric = "Temperature", unit, group });
+            new { deviceId = platform.SharedDeviceId, name, metric = "Temperature", unit, group });
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.False(string.IsNullOrWhiteSpace((await ReadAsync(response)).GetProperty("detail").GetString()));
@@ -75,7 +84,7 @@ public class ManagementApiTests(PlatformFixture platform)
     [Fact]
     public async Task Unknown_metric_or_broken_body_is_a_400_not_a_500()
     {
-        var bad = await _http.PostAsJsonAsync("/api/sensors", new { deviceId = Guid.NewGuid(), name = "x", metric = "Radioactivity", unit = "u", group = "g" });
+        var bad = await _http.PostAsJsonAsync("/api/sensors", new { deviceId = platform.SharedDeviceId, name = "x", metric = "Radioactivity", unit = "u", group = "g" });
         Assert.Equal(HttpStatusCode.BadRequest, bad.StatusCode);
 
         var empty = await _http.PostAsJsonAsync("/api/sensors", new { deviceId = Guid.Empty, name = "x", metric = "Humidity", unit = "%", group = "g" });

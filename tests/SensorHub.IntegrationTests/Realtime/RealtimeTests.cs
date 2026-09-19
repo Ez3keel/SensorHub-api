@@ -22,6 +22,7 @@ internal sealed class RealtimeApi : IAsyncDisposable
     public required ApiFactory Factory { get; init; }
     public required KafkaOptions Kafka { get; init; }
     public required string ReadingsGroupId { get; init; }
+    public required Guid DeviceId { get; init; }
     private readonly List<HubConnection> _connections = [];
 
     public static async Task<RealtimeApi> StartAsync(
@@ -45,7 +46,7 @@ internal sealed class RealtimeApi : IAsyncDisposable
 
         var factory = new ApiFactory(platform.BootstrapServers, overrides, platform.ConnectionString, platform.RedisConnectionString);
         _ = factory.Server; // sobe o host (e os consumers)
-        return new RealtimeApi { Factory = factory, Kafka = kafka, ReadingsGroupId = readingsGroup };
+        return new RealtimeApi { Factory = factory, Kafka = kafka, ReadingsGroupId = readingsGroup, DeviceId = platform.SharedDeviceId };
     }
 
     public async Task<HubConnection> ConnectAsync()
@@ -66,7 +67,7 @@ internal sealed class RealtimeApi : IAsyncDisposable
     {
         using var http = Factory.CreateClient();
         var response = await http.PostAsJsonAsync("/api/sensors",
-            new { deviceId = Guid.NewGuid(), name = $"rt-{Guid.NewGuid():N}"[..16], metric = "Temperature", unit = "°C", group });
+            new { deviceId = DeviceId, name = $"rt-{Guid.NewGuid():N}"[..16], metric = "Temperature", unit = "°C", group });
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         return doc.RootElement.GetProperty("id").GetGuid();
     }

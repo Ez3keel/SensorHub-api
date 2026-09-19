@@ -34,6 +34,9 @@ public sealed class PlatformFixture : IAsyncLifetime
     public NpgsqlDataSource DataSource { get; private set; } = null!;
     public ApiFactory Api { get; private set; } = null!;
 
+    /// <summary>Um dispositivo cadastrado que os testes reaproveitam: todo sensor precisa pertencer a um dispositivo existente (chave estrangeira).</summary>
+    public Guid SharedDeviceId { get; private set; }
+
     public async Task InitializeAsync()
     {
         await Task.WhenAll(_kafka.StartAsync(), _postgres.StartAsync(), _redis.StartAsync());
@@ -42,6 +45,14 @@ public sealed class PlatformFixture : IAsyncLifetime
         DataSource = NpgsqlDataSource.Create(ConnectionString);
         await using (var db = new SensorHubDbContext(new DbContextOptionsBuilder<SensorHubDbContext>().UseNpgsql(DataSource).Options))
             await db.Database.MigrateAsync();
+
+        await using (var db = new SensorHubDbContext(new DbContextOptionsBuilder<SensorHubDbContext>().UseNpgsql(DataSource).Options))
+        {
+            var (device, _) = SensorHub.Domain.Security.Device.Create("dispositivo-compartilhado-dos-testes", DateTimeOffset.UtcNow);
+            db.Set<SensorHub.Domain.Security.Device>().Add(device);
+            await db.SaveChangesAsync();
+            SharedDeviceId = device.Id;
+        }
 
         Api = new ApiFactory(BootstrapServers, postgresConnection: ConnectionString, redisConnection: RedisConnectionString);
         _ = Api.Server; // força o host a subir (e o provisionamento dos tópicos) antes do primeiro teste
@@ -124,6 +135,8 @@ public sealed class ApiFactory(string bootstrapServers, Dictionary<string, strin
                 ["Persistence:MigrateOnStartup"] = "false",
                 ["Redis:KeyPrefix"] = "test:",
                 ["Realtime:Enabled"] = "false",
+                // Os testes anteriores à Fase 8 não autenticam; os de segurança ligam explicitamente (Security:Enabled=true).
+                ["Security:Enabled"] = "false",
                 ["Redis:ConnectionString"] = redisConnection ?? "localhost:1,abortConnect=false,connectTimeout=500",
                 ["ConnectionStrings:Postgres"] = postgresConnection ?? "Host=localhost;Port=1;Database=none;Username=none;Password=none;Timeout=2"
             };

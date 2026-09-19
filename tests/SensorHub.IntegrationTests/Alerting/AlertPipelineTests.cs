@@ -60,7 +60,7 @@ public class AlertPipelineTests(PlatformFixture platform)
     private async Task<Guid> CreateSensorViaApiAsync()
     {
         var response = await _http.PostAsJsonAsync("/api/sensors",
-            new { deviceId = Guid.NewGuid(), name = $"s-{Guid.NewGuid():N}"[..14], metric = "Temperature", unit = "°C", group = "pipeline" });
+            new { deviceId = platform.SharedDeviceId, name = $"s-{Guid.NewGuid():N}"[..14], metric = "Temperature", unit = "°C", group = "pipeline" });
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         return doc.RootElement.GetProperty("id").GetGuid();
     }
