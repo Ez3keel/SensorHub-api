@@ -259,7 +259,7 @@ idempotente (`Interlocked.Exchange` numa flag).
 
 **3. Colisão de portas com outros containers da máquina.**
 O ambiente já roda a stack do CVAT (Traefik em 8080, Redis, etc.). Por isso o Compose do projeto usa portas
-fora do padrão (Kafka UI em 8090, e nas próximas fases Postgres 5433, Redis 6380, Grafana/Prometheus
+fora do padrão (Kafka UI em 8092, e nas próximas fases Postgres 5433, Redis 6380, Grafana/Prometheus
 em portas próprias). Não é bug de código, mas um custo real de "rodar tudo local".
 ---
 
@@ -1006,3 +1006,85 @@ a promessa resolvida guardada para sempre e nenhuma renovação futura acontecia
 **5. Nome do "reconhecido por" era escolhido pelo cliente.** Falha de autorização de dados (personificação), corrigida em D8.9.
 
 **6. Teste de "recusa de subir" esperava a exceção no lugar errado.** O host da `WebApplicationFactory` sobe no construtor, então a falha aparece ali e não na primeira requisição; o teste passou a afirmar isso.
+
+
+## Fase 9: Compose completo e prova de carga
+
+Até a Fase 8 a aplicação rodava no host (`dotnet run`) e só a infraestrutura em containers. A fase fecha o ciclo: **uma linha sobe tudo** e a prova de carga
+passa por todo o caminho real (nginx → API → Kafka → 2 Workers → Timescale/Redis), medida pelas métricas da Fase 7, não por estimativa.
+
+### D9.1: Uma imagem .NET parametrizada, multi-stage, sem root
+`docker/dotnet.Dockerfile` recebe `PROJECT` e `ENTRY` e serve API, Worker e Simulador. O SDK compila; a imagem final leva só o runtime `aspnet` e roda com o usuário
+não-root da imagem base (`USER $APP_UID`). O `restore` acontece depois de copiar **só os `.csproj`**, então a camada de pacotes NuGet só é refeita quando uma dependência muda.
+Um `.dockerignore` exclui `bin/`, `obj/`, `node_modules/`, `.git`, `.env` e chaves: segredos não podem entrar em camadas de imagem.
+
+### D9.2: Perfis do Compose: `docker compose up` continua sendo só a infraestrutura
+`apps` (api, worker×2, dashboard) e `tools` (register, load) ficam em perfis. Quem desenvolve com `dotnet run` não é atrapalhado; quem quer tudo usa `--profile apps`.
+Os hosts .NET compartilham um bloco `x-app-env` (hostnames de serviço em vez de `localhost`) por âncora YAML.
+
+### D9.3: Dashboard servido por nginx, que também é o proxy
+O navegador vê **uma origem** (`:8081`): estáticos do nginx, `/api` e `/hubs` repassados para a API. Sem CORS em produção e a API **não publica porta** no host.
+`/hubs` leva `Upgrade`/`Connection` e `proxy_read_timeout 1h` (o padrão de 60 s derrubaria o WebSocket do SignalR), e `/assets/` (nome com hash) tem cache imutável enquanto o `index.html` é `no-cache`.
+
+### D9.4: Confiar em `X-Forwarded-For` só quando declarado
+Atrás do nginx, o IP de origem que a API enxerga é o do proxy, então o limitador de login (por IP, Fase 8) agruparia **todos os usuários num único balde**. A solução é `UseForwardedHeaders`,
+mas confiar nesse cabeçalho sem proxy permite forjá-lo e escapar do limite por IP. Por isso é opt-in (`Security:TrustForwardedHeaders`), ligado só no Compose, onde a API não é alcançável diretamente.
+Dois testes: com proxy declarado, clientes diferentes têm baldes diferentes; sem declarar, um `X-Forwarded-For` forjado a cada tentativa NÃO burla o limite.
+
+### D9.5: Segredos fora da imagem e falha rápida
+`SENSORHUB_JWT_KEY`, senha do administrador e chave do dispositivo vêm do `.env` (ignorado pelo git; `.env.example` documenta). Sem a chave, a API em `Production` recusa subir (Fase 8): melhor um
+container em crash-loop com mensagem clara do que uma API aberta com segredo público. Os `register`/`load` usam `depends_on: service_healthy`.
+
+### D9.6: Healthcheck sem `curl`
+A imagem de runtime não tem `curl` nem `wget`; o healthcheck faz um `GET` cru via `/dev/tcp` do bash (bloco literal YAML para as barras invertidas do `printf`). O Worker só sobe depois da API saudável,
+porque é a API que aplica as migrações.
+
+### D9.7: Prometheus enxerga cada réplica
+`static_configs` com `worker:9464` resolveria o DNS para UM IP. Para dois Workers, `dns_sd_configs` (tipo A, refresh de 10 s) gera um alvo por réplica e o rótulo `instance` as distingue.
+
+### Resultados medidos (Docker Desktop, 1 broker, 1 Timescale, API + 2 Workers em containers, 300 sensores, lote de 500, 8 requisições concorrentes)
+
+**Carga sustentada: 20.000 leituras/s por 60 s**
+| | |
+|---|---|
+| Enviadas / falhas | 1.199.986 / 0 (taxa efetiva 19.997/s, 0 reenvios) |
+| Linhas novas no banco | **1.199.986** (igual ao enviado: zero perda, zero duplicata) |
+| Lag ao final | 0 |
+| Publicação API→Kafka (ack), p95 | 32 ms |
+| Atraso de processamento p50/p95/p99, persistência | 231 / 475 / 499 ms |
+| idem, último valor | 26 / 181 / 319 ms |
+| idem, alertas | 43 / 184 / 264 ms |
+| idem, tempo real | 22 / 95 / 568 ms |
+| Tamanho médio do lote (persistência) | ~4.750 |
+| Recursos (pós-carga, idle) | api ~330 MiB, cada worker ~310 a 350 MiB |
+
+**`kill -9` de um Worker no meio da carga (10.000/s por 45 s; réplica parada aos 12 s, religada aos 22 s)**
+- Enviadas 449.901, falhas 0. O lag chegou a **327.864** ao fim da carga (uma réplica só por ~10 s, mais o rebalance) e **drenou a 0** sozinho.
+- Linhas novas no banco: **449.901**, exatamente o enviado. O `kill -9` não perde nem duplica nada porque o offset só é commitado depois da persistência e a persistência é idempotente por `(sensor_id, ts)`.
+
+**Chave quente (1 sensor emitindo 100× mais; 10.000/s por 30 s)**
+- Mensagens por partição: p0 36.825, p1 39.828, p2 42.843, p3 36.076, **p4 106.761**, p5 37.579. A partição do sensor quente recebeu ~2,9× a média das outras: é o custo direto de
+  `chave = sensorId` (a decisão de manter a ordem por sensor). O sistema absorveu (lag final 9.551 → 0, 299.912 linhas = 299.912 enviadas).
+- Leitura honesta: com 6 partições e UM sensor quente isso é tolerável; se uma fração grande do tráfego viesse de poucos sensores, a partição vira o gargalo (um consumer por partição). Mitigações
+  conhecidas e NÃO implementadas: mais partições (não ajuda um sensor só), *salting* da chave (perde a ordem por sensor) ou tratar sensores quentes num tópico próprio.
+
+### Bugs encontrados
+
+**1. Healthcheck "unhealthy" para sempre: `cannot create /dev/tcp/...: Directory nonexistent`.** `CMD-SHELL` executa `sh` (dash), e `/dev/tcp` é recurso do **bash**. Correção: `CMD bash -c`.
+Segunda armadilha no mesmo item: `\r\n` dentro de string YAML entre aspas vira caracteres reais e quebra o comando; usei bloco literal.
+
+**2. Cadastro da frota: 109 e depois 8 falhas com 300 sensores.** O cliente disparava ~900 requisições em um minuto contra o limite da API (600/min por usuário) e contava o 429 como falha. Duas causas:
+(a) o cliente não respeitava `429 + Retry-After`; (b) o servidor devolvia `Retry-After: 1` para a janela deslizante, que **não informa** tempo de espera, então esperar 1 s era inútil (um permit só volta a
+cada segmento de 10 s). Corrigido nos dois lados (o cliente espera e repete; o servidor diz 10) e coberto por teste em cada um. Depois: 300 sensores, 600 regras, 0 falhas.
+
+**3. Cadastro falhava com login 401 (não era bug de código).** O administrador de bootstrap é idempotente e não sobrescreve a senha de um usuário existente; o banco de desenvolvimento já o tinha com outra senha.
+Consequência de desenho aceita: trocar a senha do bootstrap no `.env` não muda um administrador que já existe (é preciso usar a API). Vale documentar; o simulador agora termina com uma mensagem clara em vez de exceção não tratada.
+
+**4. Porta 8090 do Kafka UI em uso por outro container da máquina (Traefik).** Movida para 8092.
+
+**5. Teste `Consumer_resumes_from_committed_offset...` voltou a falhar na suíte completa, agora em "primeira leva".** Em vez de atribuir de novo a "carga na máquina", li o teste: ele esperava `Processed.Count == 1000` num handler
+at-least-once; se um rebalance na entrada do grupo reentrega parte do lote, o contador passa de 1000 e a condição nunca mais é verdadeira. É uma falha de **teste**, não de produto. Passou a contar mensagens distintas (sensor + instante).
+Isolado ele já passava (3 de 3 antes da correção, então o sintoma só aparece na suíte inteira); a causa do sintoma anterior (Fase 7, item 6) continua sem prova, mas esta é uma causa real e confirmada por leitura do código.
+
+**6. Ruído `libgssapi_krb5.so.2: cannot open shared object file` no log dos containers.** O librdkafka tenta carregar a biblioteca Kerberos (GSSAPI) ao iniciar; a imagem `aspnet` não a traz e o cluster usa PLAINTEXT. Inofensivo (a conexão e o consumo funcionam);
+só seria necessário com SASL/GSSAPI.

@@ -36,7 +36,7 @@ Três *consumer groups* independentes leem o mesmo tópico: é o que o Kafka faz
 | 6 | Tempo real (SignalR) + dashboard React | ✅ |
 | 7 | Observabilidade (OpenTelemetry, lag do consumer) | ✅ |
 | 8 | Segurança (JWT, chaves de API por dispositivo, rate limit) e administração | ✅ |
-| 9 | Compose completo + prova de carga | ⏳ |
+| 9 | Compose completo + prova de carga | ✅ |
 | 10 | MQTT (bridge → Kafka) | ⏳ |
 
 ## Executando localmente
@@ -58,6 +58,20 @@ dotnet run --project tools/SensorHub.Simulator -c Release -- --mode http --senso
 ```
 
 O administrador acima existe **só em desenvolvimento** (`appsettings.Development.json`). Para rodar sem autenticação, use `Security__Enabled=false`.
+
+## Tudo em containers (Compose completo)
+
+```bash
+cp .env.example .env    # preencha SENSORHUB_JWT_KEY (openssl rand -base64 48) e SENSORHUB_ADMIN_PASSWORD
+docker compose --profile apps up -d --build                       # API, 2 Workers, dashboard em http://localhost:8081
+docker compose --profile tools run --rm register                  # cadastra a frota; imprime a chave do gateway UMA vez
+echo "SENSORHUB_DEVICE_KEY=shk_..." >> .env                       # cole a chave impressa
+RATE=20000 DURATION=60 BATCH=500 WORKERS=8 docker compose --profile apps --profile tools run --rm load
+./scripts/resilience-demo.sh                                       # kill -9 de um Worker no meio da carga (HOT=100 KILL=0: chave quente)
+```
+
+Medido nesta stack (1 broker, 2 Workers, 20.000 leituras/s por 60 s): 1.199.986 enviadas, 1.199.986 gravadas, lag 0, publicação p95 32 ms,
+atraso de processamento p95 entre 95 e 475 ms. Com `kill -9` de um Worker no meio da carga, nada se perde nem se duplica. Números e limitações em `docs/DECISOES-DE-ARQUITETURA.md` (Fase 9).
 
 ## Segurança
 
