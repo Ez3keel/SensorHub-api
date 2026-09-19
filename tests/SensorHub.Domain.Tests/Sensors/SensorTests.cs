@@ -19,6 +19,16 @@ public class SensorTests
         Assert.Equal(Now, sensor.CreatedAt);
     }
 
+    [Fact]
+    public void Create_preserves_an_explicit_id_and_generates_one_otherwise()
+    {
+        var wanted = Guid.NewGuid();
+
+        Assert.Equal(wanted, Sensor.Create(Guid.NewGuid(), "s", MetricType.Humidity, "%", "g", Now, wanted).Id);
+        Assert.NotEqual(Guid.Empty, Sensor.Create(Guid.NewGuid(), "s", MetricType.Humidity, "%", "g", Now, Guid.Empty).Id);
+        Assert.NotEqual(Guid.Empty, Sensor.Create(Guid.NewGuid(), "s", MetricType.Humidity, "%", "g", Now).Id);
+    }
+
     [Theory]
     [InlineData("")]
     [InlineData("   ")]

@@ -22,14 +22,18 @@ public sealed class Sensor
 
     private Sensor() { } // EF
 
-    public static Sensor Create(Guid deviceId, string name, MetricType metric, string unit, string group, DateTimeOffset now)
+    /// <param name="id">
+    /// Id opcional: importar/registrar sensores que já têm identidade fora do SensorHub (frota existente, simulador)
+    /// exige preservá-la, senão as leituras já publicadas apontariam para sensores "desconhecidos".
+    /// </param>
+    public static Sensor Create(Guid deviceId, string name, MetricType metric, string unit, string group, DateTimeOffset now, Guid? id = null)
     {
         if (deviceId == Guid.Empty) throw new DomainException("DeviceId não pode ser vazio.");
         if (!Enum.IsDefined(metric)) throw new DomainException("Métrica inválida.");
 
         return new Sensor
         {
-            Id = Guid.NewGuid(),
+            Id = id is { } given && given != Guid.Empty ? given : Guid.NewGuid(),
             DeviceId = deviceId,
             Name = RequireText(name, nameof(name), 100),
             Metric = metric,

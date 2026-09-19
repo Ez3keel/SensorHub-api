@@ -193,13 +193,43 @@ public class AlertRuleTests
         var lastSeen = T0;
 
         Assert.Equal(Transition.None, rule.EvaluateSilence(state, lastSeen, T0.AddMinutes(1)).Transition);
-        Assert.Equal(Transition.Fired, rule.EvaluateSilence(state, lastSeen, T0.AddMinutes(2)).Transition);
+        var fired = rule.EvaluateSilence(state, lastSeen, T0.AddMinutes(2));
+        Assert.Equal(Transition.Fired, fired.Transition);
+        Assert.Equal(T0.AddMinutes(2), fired.At); // instante em que o silêncio cruzou o limite (lastSeen + duração)
         Assert.Equal(Transition.None, rule.EvaluateSilence(state, lastSeen, T0.AddMinutes(9)).Transition); // sem repetir
 
         // sensor volta: uma leitura recente resolve
         var back = rule.Evaluate(state, At(TimeSpan.FromMinutes(10), 1), T0.AddMinutes(10));
         Assert.Equal(Transition.Resolved, back.Transition);
         Assert.Equal(RuleStatus.Normal, state.Status);
+    }
+
+    [Fact]
+    public void NoData_fired_instant_is_deterministic_regardless_of_when_the_sweep_runs()
+    {
+        var rule = Rule(RuleType.NoData, duration: TimeSpan.FromMinutes(2));
+
+        // duas varreduras em momentos diferentes (ex.: antes e depois de um crash) veem o MESMO instante de disparo,
+        // então o Id determinístico do Alert é o mesmo e não nasce um segundo alerta
+        var a = rule.EvaluateSilence(rule.NewState(), T0, T0.AddMinutes(3));
+        var b = rule.EvaluateSilence(rule.NewState(), T0, T0.AddMinutes(45));
+
+        Assert.Equal(a.At, b.At);
+        Assert.Equal(Alert.DeterministicId(rule.Id, a.At), Alert.DeterministicId(rule.Id, b.At));
+    }
+
+    [Fact]
+    public void NoData_is_never_fired_by_a_reading_even_when_it_looks_old_compared_to_the_clock()
+    {
+        var rule = Rule(RuleType.NoData, duration: TimeSpan.FromMinutes(2));
+        var state = rule.NewState();
+
+        // replay de backlog: a leitura tem 1 hora de idade em relação ao relógio, mas o sensor está reportando
+        var replayed = rule.Evaluate(state, At(TimeSpan.Zero, 1), T0.AddHours(1));
+
+        Assert.Equal(Transition.None, replayed.Transition);
+        Assert.Equal(RuleStatus.Normal, state.Status);
+        Assert.Equal(T0, state.LastEventTime); // mas a última leitura vista fica registrada para a varredura
     }
 
     [Fact]

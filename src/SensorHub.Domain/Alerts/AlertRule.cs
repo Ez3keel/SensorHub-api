@@ -137,8 +137,12 @@ public sealed class AlertRule
                 return Step(state, reading.Value, reading.Timestamp, sustain: Duration);
 
             case RuleType.NoData:
-                // Chegou dado: se estava "offline" e o dado é recente, o sensor voltou.
-                return EvaluateSilence(state, reading.Timestamp, now);
+                // Uma leitura só pode RESOLVER um "sem dados" (o sensor voltou), nunca dispará-lo. Se pudesse,
+                // reprocessar um backlog antigo (leituras com horas de idade em relação ao relógio) faria um
+                // sensor saudável parecer mudo e dispararia um alerta falso. Quem dispara é a varredura por relógio.
+                return state.Status == RuleStatus.Firing
+                    ? EvaluateSilence(state, reading.Timestamp, now)
+                    : RuleEvaluation.None;
 
             case RuleType.WindowAverage:
             {
@@ -175,18 +179,22 @@ public sealed class AlertRule
 
         var silent = now - lastSeen.Value >= Duration;
 
+        // Os instantes das transições NÃO usam o relógio ("agora"): usam fatos observáveis (quando o silêncio
+        // cruzou o limite; quando o dado voltou). Assim uma reavaliação após queda produz exatamente o mesmo
+        // instante, e o Id determinístico do Alert continua evitando duplicatas. Com "now" cada replay seria outro alerta.
         if (state.Status == RuleStatus.Normal && silent)
         {
+            var firedAt = lastSeen.Value + Duration;
             state.Status = RuleStatus.Firing;
-            state.FiredAt = now;
-            return new RuleEvaluation(Transition.Fired, null, now);
+            state.FiredAt = firedAt;
+            return new RuleEvaluation(Transition.Fired, null, firedAt);
         }
 
         if (state.Status == RuleStatus.Firing && !silent)
         {
             state.Status = RuleStatus.Normal;
             state.FiredAt = null;
-            return new RuleEvaluation(Transition.Resolved, null, now);
+            return new RuleEvaluation(Transition.Resolved, null, lastSeen.Value);
         }
 
         return RuleEvaluation.None;
