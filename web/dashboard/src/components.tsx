@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { Area, AreaChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import { hasRole, login, type Session } from './auth'
 import { acknowledge, recentReadings, series, type AlertDto, type Sensor, type SeriesPoint } from './api'
 import type { ConnectionStatus } from './realtime'
 import { formatValue, isStale, sortAlerts, type OpenAlerts, type LiveState, type Point, type ReadingPush } from './telemetryState'
@@ -170,11 +171,14 @@ export function SensorDetail({ sensor, detailReadings, onClose }: { sensor: Sens
 export function AlertsPanel({
   alerts,
   sensors,
+  session,
   onAcknowledged,
   onSelectSensor,
 }: {
   alerts: OpenAlerts
   sensors: Sensor[]
+  /** null = API em modo aberto (segurança desligada): o nome do operador é digitado. */
+  session: Session | null
   onAcknowledged: (a: AlertDto) => void
   onSelectSensor: (sensorId: string) => void
 }) {
@@ -184,11 +188,11 @@ export function AlertsPanel({
   const list = sortAlerts(alerts)
 
   async function ack(alert: AlertDto) {
-    if (!user.trim()) return setError('Informe seu nome para reconhecer alertas.')
-    localStorage.setItem('sensorhub.user', user.trim())
+    if (!session && !user.trim()) return setError('Informe seu nome para reconhecer alertas.')
+    if (!session) localStorage.setItem('sensorhub.user', user.trim())
     try {
       setError(null)
-      onAcknowledged(await acknowledge(alert.id, user.trim()))
+      onAcknowledged(await acknowledge(alert.id, session ? undefined : user.trim()))
     } catch (e) {
       setError((e as Error).message)
     }
@@ -199,7 +203,7 @@ export function AlertsPanel({
       <h2>
         Alertas abertos <span className="count">{list.length}</span>
       </h2>
-      <input className="user" placeholder="seu nome (para reconhecer)" value={user} onChange={(e) => setUser(e.target.value)} />
+      {!session && <input className="user" placeholder="seu nome (para reconhecer)" value={user} onChange={(e) => setUser(e.target.value)} />}
       {error && <p className="error">{error}</p>}
       {list.length === 0 && <p className="muted">Nenhum alerta aberto.</p>}
       <ul>
@@ -216,9 +220,12 @@ export function AlertsPanel({
             {a.status === 'Acknowledged' ? (
               <p className="muted">reconhecido por {a.acknowledgedBy}</p>
             ) : (
-              <button className="ghost" onClick={() => void ack(a)}>
-                Reconhecer
-              </button>
+              // esconder é só cortesia: quem barra o Viewer de verdade é a API (403)
+              (!session || hasRole(session, 'Operator')) && (
+                <button className="ghost" onClick={() => void ack(a)}>
+                  Reconhecer
+                </button>
+              )
             )}
           </li>
         ))}
@@ -241,6 +248,47 @@ export function Toasts({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id:
           <strong>{t.alert.severity}</strong> {t.alert.message}
         </div>
       ))}
+    </div>
+  )
+}
+
+export function LoginForm({ onSuccess }: { onSuccess: () => void }) {
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  async function submit(e: FormEvent) {
+    e.preventDefault()
+    setBusy(true)
+    setError(null)
+    try {
+      await login(email.trim(), password)
+      setPassword('')
+      onSuccess()
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="login-page">
+      <form className="login" onSubmit={(e) => void submit(e)} aria-label="Entrar">
+        <h1>SensorHub</h1>
+        <p className="muted">Entre para acompanhar a telemetria.</p>
+        <label>
+          E-mail
+          <input type="email" autoComplete="username" required value={email} onChange={(e) => setEmail(e.target.value)} />
+        </label>
+        <label>
+          Senha
+          <input type="password" autoComplete="current-password" required value={password} onChange={(e) => setPassword(e.target.value)} />
+        </label>
+        {error && <p className="error" role="alert">{error}</p>}
+        <button type="submit" disabled={busy}>{busy ? 'Entrando…' : 'Entrar'}</button>
+      </form>
     </div>
   )
 }

@@ -1,4 +1,5 @@
 // Cliente da API REST. Em dev o Vite faz proxy de /api para a API; em produção o nginx faz o mesmo.
+import { getSession, refresh } from './auth'
 
 export interface Sensor {
   id: string
@@ -46,11 +47,33 @@ export interface AlertDto {
   resolvedAt: string | null
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
+/** Verdadeiro se a API respondeu 401 mesmo depois de uma renovação: a sessão acabou e o app volta para o login. */
+export class UnauthorizedError extends Error {
+  constructor() {
+    super('Sessão expirada. Entre novamente.')
+  }
+}
+
+async function send(path: string, init?: RequestInit): Promise<Response> {
+  const token = getSession()?.accessToken
+  return fetch(path, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(init?.headers ?? {}),
+    },
   })
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  let response = await send(path, init)
+  if (response.status === 401 && getSession()) {
+    // access token vencido: renova UMA vez (single-flight) e repete a chamada
+    if (!(await refresh())) throw new UnauthorizedError()
+    response = await send(path, init)
+    if (response.status === 401) throw new UnauthorizedError()
+  }
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`
     try {
@@ -101,6 +124,7 @@ export function openAlerts(): Promise<AlertDto[]> {
   ]).then(([firing, acknowledged]) => [...firing, ...acknowledged])
 }
 
-export function acknowledge(alertId: string, user: string): Promise<AlertDto> {
+/** Autenticado, a API usa o usuário do token e ignora `user`; só sem segurança (modo aberto) o nome digitado vale. */
+export function acknowledge(alertId: string, user?: string): Promise<AlertDto> {
   return request<AlertDto>(`/api/alerts/${alertId}/acknowledge`, { method: 'POST', body: JSON.stringify({ user }) })
 }

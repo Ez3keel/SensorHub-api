@@ -1,4 +1,5 @@
 import { HubConnection, HubConnectionBuilder, HubConnectionState, LogLevel } from '@microsoft/signalr'
+import { getAccessToken } from './auth'
 import type { AlertPush, ReadingPush } from './telemetryState'
 
 export type ConnectionStatus = 'connecting' | 'connected' | 'reconnecting' | 'disconnected'
@@ -24,7 +25,8 @@ export class TelemetryClient {
 
   constructor(private readonly events: TelemetryEvents, url = '/hubs/telemetry') {
     this.connection = new HubConnectionBuilder()
-      .withUrl(url)
+      // a fábrica roda a cada (re)conexão: o token renovado é usado sem o app precisar reiniciar o hub
+      .withUrl(url, { accessTokenFactory: () => getAccessToken() })
       .withAutomaticReconnect([0, 1000, 2000, 5000, 10000, 30000])
       .configureLogging(LogLevel.Warning)
       .build()

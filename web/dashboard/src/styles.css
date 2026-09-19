@@ -70,3 +70,13 @@ code { background: #1f2937; padding: 1px 6px; border-radius: 4px; }
 
 .toasts { position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 10; }
 .toast { background: var(--panel); border: 1px solid var(--border); border-left-width: 4px; border-radius: 8px; padding: 10px 14px; max-width: 360px; font-size: 13px; cursor: pointer; }
+
+.login-page { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
+.login { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 28px; width: min(360px, 100%); display: flex; flex-direction: column; gap: 14px; }
+.login h1 { font-size: 22px; }
+.login label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+.login input { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; color: var(--text); font-size: 14px; }
+.login button[type='submit'] { background: var(--green); color: #052e16; border: none; border-radius: 8px; padding: 9px; font-weight: 600; }
+.login button[disabled] { opacity: .6; }
+.who { margin-left: auto; display: flex; gap: 10px; align-items: center; font-size: 13px; color: var(--muted); }
+.role { border: 1px solid var(--border); border-radius: 999px; padding: 1px 10px; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
