@@ -125,7 +125,9 @@ public class BatchConsumerTests(PlatformFixture platform)
         var first = new RecordingHandler();
         await using (var run1 = await StartAsync(kafka, first, group))
         {
-            await EventuallyAsync(() => Task.FromResult(first.Processed.Count == 1000), "primeira leva");
+            // at-least-once: um rebalance na entrada do grupo pode reentregar parte do lote, então "== 1000" jamais voltaria a ser
+            // verdadeiro depois de passar de 1000. Conta mensagens DISTINTAS (sensor + instante), que é o que importa aqui.
+            await EventuallyAsync(() => Task.FromResult(first.Processed.Select(r => (r.Reading.SensorId, r.Reading.Timestamp)).Distinct().Count() >= 1000), "primeira leva");
             // O commit do offset acontece DEPOIS do handler. Parar antes dele é permitido (at-least-once: o lote seria
             // reentregue), mas então o "sem reprocessar" deste teste não se aplica. Espera o commit chegar ao broker.
             await EventuallyAsync(() => Task.FromResult(GetLag(kafka.BootstrapServers, kafka.ReadingsTopic, group) == 0), "offsets commitados");
