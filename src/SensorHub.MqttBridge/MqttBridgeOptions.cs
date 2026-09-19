@@ -31,6 +31,13 @@ public sealed class MqttBridgeOptions
     /// <summary>Acima disso a mensagem é descartada como malformada (o broker também limita: <c>message_size_limit</c>).</summary>
     public int MaxPayloadBytes { get; set; } = 262_144;
 
+    /// <summary>
+    /// Mensagens processadas ao mesmo tempo por réplica. Um dispositivo manda mensagens PEQUENAS; processá-las uma a uma limita a vazão à
+    /// latência de cada uma (medido: ~30 ms => ~30 msg/s => centenas de leituras/s). Com N em voo, o produtor Kafka ainda agrupa os lotes.
+    /// Chegando a N, o bridge para de ler do socket e o broker (max_inflight_messages) segura o resto: contrapressão sem fila em memória.
+    /// </summary>
+    public int MaxConcurrency { get; set; } = 64;
+
     /// <summary>Tentativas de publicar no Kafka antes de desistir e derrubar a conexão para o broker reentregar.</summary>
     public int PublishRetries { get; set; } = 5;
 

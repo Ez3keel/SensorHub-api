@@ -23,6 +23,7 @@ public sealed class MqttBridgeService(
     ILogger<MqttBridgeService> logger) : BackgroundService
 {
     private readonly MqttBridgeOptions _options = options.Value;
+    private readonly SemaphoreSlim _slots = new(Math.Max(1, options.Value.MaxConcurrency));
     private readonly IMqttClient _client = new MqttClientFactory().CreateMqttClient();
     private CancellationToken _stopping;
     private bool _everConnected;
@@ -51,6 +52,11 @@ public sealed class MqttBridgeService(
             try { await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken); }
             catch (OperationCanceledException) { break; }
         }
+
+        // Espera (até 10 s) as mensagens em voo terminarem para não largar leituras já lidas do broker; o que não terminar
+        // fica sem PUBACK e o broker reentrega na próxima sessão.
+        for (var i = 0; i < _options.MaxConcurrency; i++)
+            if (!await _slots.WaitAsync(TimeSpan.FromSeconds(10))) break;
 
         if (_client.IsConnected) await _client.DisconnectAsync();
         _client.Dispose();
@@ -92,27 +98,48 @@ public sealed class MqttBridgeService(
     {
         e.AutoAcknowledge = false; // o PUBACK só sai depois que o Kafka confirmar
 
-        MessageDisposition disposition;
-        try
-        {
-            disposition = await ProcessAsync(e.ApplicationMessage.Topic, System.Buffers.BuffersExtensions.ToArray(e.ApplicationMessage.Payload), _stopping);
-        }
-        catch (OperationCanceledException) when (_stopping.IsCancellationRequested)
-        {
-            return; // encerrando: não confirma, o broker reentrega na próxima sessão
-        }
+        // Limite de mensagens em voo. Enquanto não há vaga, ESTE handler espera: o cliente MQTT deixa de ler do socket e o broker
+        // (max_inflight_messages) segura as demais, ou seja, a contrapressão chega até o broker sem enfileirar nada em memória aqui.
+        try { await _slots.WaitAsync(_stopping); }
+        catch (OperationCanceledException) { return; }
 
-        if (disposition == MessageDisposition.Ack)
+        // Copia AGORA: o buffer do evento pode ser reaproveitado depois que o handler retorna.
+        var topic = e.ApplicationMessage.Topic;
+        var payload = System.Buffers.BuffersExtensions.ToArray(e.ApplicationMessage.Payload);
+
+        _ = Task.Run(async () =>
         {
-            await e.AcknowledgeAsync(_stopping);
-        }
-        else
-        {
-            // Sem PUBACK e com a conexão viva o broker só reenviaria na próxima reconexão. Derrubar a conexão a antecipa
-            // (o laço de ExecuteAsync reconecta e a sessão persistente reentrega o que ficou pendente).
-            logger.LogWarning("Kafka indisponível para o bridge: derrubando a conexão para o broker reentregar as mensagens pendentes.");
-            _ = Task.Run(() => _client.DisconnectAsync(), CancellationToken.None);
-        }
+            try
+            {
+                // CancellationToken.None de propósito: no encerramento as mensagens JÁ lidas terminam (o laço de retentativas é limitado)
+                // em vez de serem abortadas; quem não terminar fica sem PUBACK e o broker reentrega.
+                var disposition = await ProcessAsync(topic, payload, CancellationToken.None);
+                if (disposition == MessageDisposition.Ack)
+                {
+                    await e.AcknowledgeAsync(CancellationToken.None);
+                }
+                else
+                {
+                    // Sem PUBACK e com a conexão viva o broker só reenviaria na próxima reconexão. Derrubar a conexão a antecipa
+                    // (o laço de ExecuteAsync reconecta e a sessão persistente reentrega o que ficou pendente).
+                    logger.LogWarning("Kafka indisponível para o bridge: derrubando a conexão para o broker reentregar as mensagens pendentes.");
+                    await _client.DisconnectAsync();
+                }
+            }
+            catch (OperationCanceledException) when (_stopping.IsCancellationRequested)
+            {
+                // encerrando: não confirma, o broker reentrega na próxima sessão
+            }
+            catch (Exception ex)
+            {
+                // Nunca deixe uma exceção escapar de uma tarefa "solta": ela sumiria. Sem PUBACK a mensagem será reentregue.
+                logger.LogError(ex, "Falha inesperada ao tratar uma mensagem MQTT (será reentregue).");
+            }
+            finally
+            {
+                _slots.Release();
+            }
+        }, CancellationToken.None);
     }
 
     /// <summary>Núcleo testável (sem MQTT): decide o destino de UMA mensagem e a resolve.</summary>

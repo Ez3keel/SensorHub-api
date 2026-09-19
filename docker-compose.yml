@@ -211,6 +211,67 @@ services:
     ports:
       - "8081:80"
 
+  # ---------------------------------------------------------------- MQTT (Fase 10, perfil "apps")
+  mosquitto:
+    # Mosquitto com o plugin go-auth: pergunta a autenticação/ACL ao serviço mqtt-auth (mesma chave de API da ingestão HTTP).
+    profiles: ["apps"]
+    image: iegomez/mosquitto-go-auth:latest
+    restart: unless-stopped
+    depends_on:
+      mqtt-auth: { condition: service_healthy }
+    ports:
+      - "1884:1883"     # 1884 no host: evita colisão com outro Mosquitto da máquina
+    volumes:
+      - ./docker/mosquitto/mosquitto.conf:/etc/mosquitto/mosquitto.conf:ro
+      - mosquitto-data:/var/lib/mosquitto
+
+  # Autenticação e ACL do broker: processo PRÓPRIO e sem Kafka. Se ficasse junto do consumidor, um deploy do bridge faria o
+  # broker falhar toda checagem de ACL e desconectaria todos os dispositivos.
+  mqtt-auth:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: docker/dotnet.Dockerfile
+      args: { PROJECT: src/SensorHub.MqttBridge, ENTRY: SensorHub.MqttBridge.dll }
+    image: sensorhub-mqtt-bridge:local
+    restart: unless-stopped
+    depends_on:
+      timescaledb: { condition: service_healthy }
+      api: { condition: service_healthy }   # a API aplica as migrações
+    expose: ["8080"]                        # só a rede do Compose (o broker) alcança estes endpoints
+    environment:
+      <<: *app-env
+      Mqtt__Roles__0: auth
+      Mqtt__BridgePassword: ${SENSORHUB_MQTT_BRIDGE_PASSWORD:-}
+    healthcheck: &dotnet-health
+      test:
+        - CMD
+        - bash
+        - -c
+        - |
+          exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /health/live HTTP/1.0\r\n\r\n' >&3 && head -1 <&3 | grep -q 200
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # Consumidor MQTT -> Kafka. Escalável: as réplicas compartilham a carga por assinatura compartilhada ($share).
+  mqtt-bridge:
+    profiles: ["apps"]
+    image: sensorhub-mqtt-bridge:local
+    restart: unless-stopped
+    depends_on:
+      mosquitto: { condition: service_started }
+      kafka: { condition: service_healthy }
+    expose: ["8080"]
+    environment:
+      <<: *app-env
+      Mqtt__Roles__0: bridge
+      Mqtt__Host: mosquitto
+      Mqtt__Port: "1883"
+      Mqtt__BridgePassword: ${SENSORHUB_MQTT_BRIDGE_PASSWORD:-}
+    healthcheck: *dotnet-health
+
   # ---------------------------------------------------------------- ferramentas (perfil "tools")
   register:
     profiles: ["tools"]
@@ -235,8 +296,20 @@ services:
               "--duration", "${DURATION:-60}", "--batch", "${BATCH:-100}", "--workers", "${WORKERS:-4}", "--hot", "${HOT:-1}",
               "--api-key", "${SENSORHUB_DEVICE_KEY:-}"]
 
+  # Mesma carga, mas como dispositivo MQTT: usuário = id do gateway, senha = a chave de API.
+  load-mqtt:
+    profiles: ["tools"]
+    image: sensorhub-simulator:local
+    depends_on:
+      mosquitto: { condition: service_started }
+      mqtt-bridge: { condition: service_healthy }
+    command: ["--mode", "mqtt", "--mqtt-host", "mosquitto", "--mqtt-port", "1883", "--sensors", "${SENSORS:-300}", "--rate", "${RATE:-3000}",
+              "--duration", "${DURATION:-60}", "--batch", "${BATCH:-100}", "--workers", "${WORKERS:-4}", "--hot", "${HOT:-1}",
+              "--api-key", "${SENSORHUB_DEVICE_KEY:-}"]
+
 volumes:
   kafka-data:
+  mosquitto-data:
   redis-data:
   prometheus-data:
   grafana-data:

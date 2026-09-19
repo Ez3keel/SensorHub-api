@@ -13,7 +13,7 @@ public sealed record LoadOptions(
     /// <summary>Depois deste tempo, <see cref="SilenceFraction"/> dos sensores param de emitir (cenário "sensor morreu").</summary>
     TimeSpan? SilenceAfter = null, double SilenceFraction = 0);
 
-public sealed record LoadReport(long Sent, long Failed, TimeSpan Elapsed)
+public sealed record LoadReport(long Sent, long Failed, TimeSpan Elapsed, string? FirstError = null)
 {
     public double AchievedRate => Elapsed.TotalSeconds > 0 ? Sent / Elapsed.TotalSeconds : 0;
 }
@@ -34,6 +34,7 @@ public sealed class LoadRunner
         if (options.Workers <= 0) throw new ArgumentOutOfRangeException(nameof(options), "Workers deve ser > 0.");
 
         long sent = 0, failed = 0;
+        string? firstError = null; // "Falhas: 300.000" sem dizer POR QUÊ obriga a caçar nos logs do outro lado
         var silenced = false;
         var clock = Stopwatch.StartNew();
         var perWorkerRate = (double)options.RatePerSecond / options.Workers;
@@ -74,16 +75,17 @@ public sealed class LoadRunner
                 {
                     return;
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
                     Interlocked.Add(ref failed, size);
+                    Interlocked.CompareExchange(ref firstError, $"{ex.GetType().Name}: {ex.Message}", null);
                 }
             }
         }
 
         await Task.WhenAll(Enumerable.Range(0, options.Workers).Select(_ => Worker()));
         clock.Stop();
-        return new LoadReport(Interlocked.Read(ref sent), Interlocked.Read(ref failed), clock.Elapsed);
+        return new LoadReport(Interlocked.Read(ref sent), Interlocked.Read(ref failed), clock.Elapsed, firstError);
     }
 }
 

@@ -11,6 +11,7 @@ COPY src/SensorHub.Application/*.csproj src/SensorHub.Application/
 COPY src/SensorHub.Infrastructure/*.csproj src/SensorHub.Infrastructure/
 COPY src/SensorHub.Api/*.csproj src/SensorHub.Api/
 COPY src/SensorHub.Worker/*.csproj src/SensorHub.Worker/
+COPY src/SensorHub.MqttBridge/*.csproj src/SensorHub.MqttBridge/
 COPY tools/SensorHub.Simulator/*.csproj tools/SensorHub.Simulator/
 RUN dotnet restore ${PROJECT}
 

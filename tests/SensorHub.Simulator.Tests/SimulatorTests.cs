@@ -240,6 +240,7 @@ public class LoadRunnerTests
 
         Assert.True(report.Failed > 0);
         Assert.Equal(0, report.Sent);
+        Assert.False(string.IsNullOrWhiteSpace(report.FirstError)); // o relatório diz POR QUE falhou, não só quantas
     }
 
     [Fact]
@@ -320,6 +321,17 @@ public class SimulatorSettingsTests
         Assert.Equal(20000, s.Rate);
         Assert.Equal(0.05, s.DuplicateProbability);
         Assert.Equal("http", s.Mode);
+    }
+
+    [Fact]
+    public void Parse_reads_the_mqtt_options_and_defaults_to_the_compose_port()
+    {
+        var defaults = SimulatorSettings.Parse(["--mode", "mqtt"]);
+        Assert.Equal("localhost", defaults.MqttHost);
+        Assert.Equal(1884, defaults.MqttPort);
+
+        var custom = SimulatorSettings.Parse(["--mode", "mqtt", "--mqtt-host", "mosquitto", "--mqtt-port", "1883", "--api-key", "shk_x"]);
+        Assert.Equal(("mosquitto", 1883, "shk_x"), (custom.MqttHost, custom.MqttPort, custom.ApiKey));
     }
 
     [Theory]

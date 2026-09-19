@@ -21,6 +21,14 @@ scrape_configs:
         port: 9464
         refresh_interval: 10s
 
+  # MQTT: o bridge (consumidor) e o backend de autenticação são processos separados, ambos com /metrics.
+  - job_name: sensorhub-mqtt-bridge
+    static_configs:
+      - targets: ['mqtt-bridge:8080']
+  - job_name: sensorhub-mqtt-auth
+    static_configs:
+      - targets: ['mqtt-auth:8080']
+
   # Lag medido DE FORA, pelo broker: continua existindo mesmo se todos os consumers morrerem (o gauge interno
   # sensorhub_consumer_lag some junto com o consumer que o reportava).
   - job_name: kafka-exporter

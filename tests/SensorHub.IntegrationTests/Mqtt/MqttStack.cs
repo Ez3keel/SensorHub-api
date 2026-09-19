@@ -60,7 +60,7 @@ internal sealed class MqttStack : IAsyncDisposable
 
         // O container alcança o bridge (no host) por host.docker.internal; o cache cai para 1 s para os testes de rotação/desativação.
         var conf = (await File.ReadAllTextAsync(FindRepoFile("docker/mosquitto/mosquitto.conf")))
-            .Replace("auth_opt_http_host mqtt-bridge", "auth_opt_http_host host.docker.internal")
+            .Replace("auth_opt_http_host mqtt-auth", "auth_opt_http_host host.docker.internal")
             .Replace("auth_opt_http_port 8080", $"auth_opt_http_port {authPort}")
             .Replace("auth_opt_auth_cache_seconds 30", "auth_opt_auth_cache_seconds 1")
             .Replace("auth_opt_acl_cache_seconds 30", "auth_opt_acl_cache_seconds 1")

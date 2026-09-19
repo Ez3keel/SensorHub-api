@@ -69,7 +69,8 @@ IReadingSink sink = settings.Mode switch
 {
     "dry-run" => new CountingSink(),
     "http" => new HttpReadingSink(httpClient, settings.ApiKey),
-    _ => throw new NotSupportedException($"Modo '{settings.Mode}' não suportado (use dry-run ou http).")
+    "mqtt" => new MqttReadingSink(settings.MqttHost, settings.MqttPort, fleet.Sensors[0].DeviceId, settings.ApiKey),
+    _ => throw new NotSupportedException($"Modo '{settings.Mode}' não suportado (use dry-run, http ou mqtt).")
 };
 
 Console.WriteLine($"Simulador: {settings.Sensors} sensores, {settings.Rate} leituras/s, {settings.DurationSeconds}s, modo {settings.Mode}");
@@ -81,6 +82,13 @@ var report = await new LoadRunner().RunAsync(
     cts.Token);
 
 Console.WriteLine($"Enviadas: {report.Sent:N0}  Falhas: {report.Failed:N0}  Tempo: {report.Elapsed.TotalSeconds:F1}s  Taxa: {report.AchievedRate:N0}/s");
+if (report.FirstError is not null)
+    Console.Error.WriteLine($"Primeira falha: {report.FirstError}");
 if (sink is HttpReadingSink http)
     Console.WriteLine($"Reenvios por backpressure/rede: {http.Retries:N0}");
+if (sink is MqttReadingSink mqtt)
+{
+    Console.WriteLine($"Reenvios por reconexão: {mqtt.Retries:N0}");
+    await mqtt.DisposeAsync();
+}
 return report.Failed > 0 ? 1 : 0;

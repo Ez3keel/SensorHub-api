@@ -1,6 +1,7 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
+    <PackageReference Include="MQTTnet" Version="5.2.0.1603" />
     <ProjectReference Include="..\..\src\SensorHub.Domain\SensorHub.Domain.csproj" />
   </ItemGroup>
 

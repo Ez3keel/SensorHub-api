@@ -41,6 +41,22 @@ public class MqttBridgeTests(PlatformFixture platform)
         Assert.Equal(20, stack.ReadKafka(20, new HashSet<Guid> { device.SensorId }).Count);
     }
 
+    [Fact]
+    public async Task Many_small_messages_are_all_delivered_when_processed_concurrently()
+    {
+        await using var stack = await MqttStack.StartAsync(platform);
+        var device = await stack.CreateDeviceAsync();
+        var now = DateTimeOffset.UtcNow;
+
+        using var client = await stack.ConnectAsync(device.Id.ToString(), device.ApiKey);
+        for (var i = 0; i < 400; i++)   // 400 mensagens de 1 leitura, como um dispositivo real que manda pouco e sempre
+            await MqttStack.PublishAsync(client, TopicOf(device),
+                $$"""{"sensorId":"{{device.SensorId}}","timestamp":"{{now.AddSeconds(-i - 1):O}}","value":{{i}},"unit":"°C"}""");
+
+        var read = stack.ReadKafka(400, new HashSet<Guid> { device.SensorId }, TimeSpan.FromSeconds(45));
+        Assert.Equal(400, read.Select(m => m.Message.Timestamp).Distinct().Count()); // nenhuma perdida (duplicatas seriam toleradas: at-least-once)
+    }
+
     // ------------------------------------------------------------------ autenticação
 
     [Fact]
