@@ -25,6 +25,13 @@ public sealed class MqttBridgeOptions
     /// <summary>Réplicas do bridge no MESMO grupo compartilham a carga (<c>$share</c>): cada mensagem vai a UMA delas.</summary>
     public string SharedGroup { get; set; } = "sensorhub-bridge";
 
+    /// <summary>
+    /// Identidade da sessão MQTT desta réplica. TEM que ser ESTÁVEL entre reinícios: a sessão persistente (e as mensagens QoS 1 que o broker guardou
+    /// enquanto o bridge estava fora) pertencem a este id. Derivá-lo do hostname do container (que muda a cada deploy) deixava as mensagens presas
+    /// numa sessão órfã. Com várias réplicas, cada uma precisa do SEU id fixo (ex.: o ordinal de um StatefulSet).
+    /// </summary>
+    public string ClientId { get; set; } = "sensorhub-bridge-1";
+
     /// <summary>Quanto tempo o broker guarda a sessão (e as mensagens QoS 1 pendentes) de um bridge que caiu.</summary>
     public int SessionExpirySeconds { get; set; } = 3600;
 

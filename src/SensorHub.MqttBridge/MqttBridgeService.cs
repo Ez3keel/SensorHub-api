@@ -65,8 +65,9 @@ public sealed class MqttBridgeService(
 
     private async Task ConnectAsync(CancellationToken ct)
     {
-        // Um clientId FIXO por réplica + sessão persistente: é o que faz o broker guardar as mensagens QoS 1 enquanto o bridge está fora.
-        var clientId = $"sensorhub-bridge-{Environment.MachineName}";
+        // Um clientId FIXO por réplica + sessão persistente: é o que faz o broker guardar as mensagens QoS 1 enquanto o bridge está fora
+        // e entregá-las ao MESMO id quando ele volta (por isso não pode depender do hostname do container).
+        var clientId = _options.ClientId;
         var connectOptions = new MqttClientOptionsBuilder()
             .WithTcpServer(_options.Host, _options.Port)
             .WithClientId(clientId)

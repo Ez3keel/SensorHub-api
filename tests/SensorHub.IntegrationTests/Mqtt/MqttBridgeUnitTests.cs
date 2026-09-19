@@ -155,6 +155,14 @@ public class MqttAccessPolicyTests
     }
 
     [Fact]
+    public void The_session_client_id_is_stable_and_not_derived_from_the_container_hostname()
+    {
+        // Um id que muda a cada deploy deixaria as mensagens QoS 1 guardadas pelo broker presas numa sessão órfã.
+        Assert.Equal(new MqttBridgeOptions().ClientId, new MqttBridgeOptions().ClientId);
+        Assert.DoesNotContain(Environment.MachineName, new MqttBridgeOptions().ClientId, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void Roles_default_to_both_and_can_be_split()
     {
         Assert.True(new MqttBridgeOptions().HasRole("auth"));
