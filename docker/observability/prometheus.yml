@@ -1,0 +1,24 @@
+# Prometheus do SensorHub. Cada job lista DOIS alvos: o processo rodando no host (dotnet run, via host.docker.internal) e o
+# container do Compose completo (perfil "apps"). O que não estiver no ar aparece como "down", sem prejuízo.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: sensorhub-api
+    static_configs:
+      - targets: ['host.docker.internal:5080', 'api:8080']
+
+  - job_name: sensorhub-worker
+    static_configs:
+      - targets: ['host.docker.internal:9464', 'worker:9464']
+
+  # Lag medido DE FORA, pelo broker: continua existindo mesmo se todos os consumers morrerem (o gauge interno
+  # sensorhub_consumer_lag some junto com o consumer que o reportava).
+  - job_name: kafka-exporter
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
