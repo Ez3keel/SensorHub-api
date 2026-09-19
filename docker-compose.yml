@@ -1,7 +1,19 @@
 # Infraestrutura local do SensorHub. Cada fase adiciona seus serviços aqui.
-#   docker compose up -d           sobe a infraestrutura
-#   docker compose down -v         derruba e apaga volumes
+#   docker compose up -d                          só a infraestrutura (API/Worker rodam no host com dotnet run)
+#   docker compose --profile apps up -d --build   TUDO: API, 2 Workers, dashboard (http://localhost:8081)
+#   docker compose --profile tools run --rm register   cadastra a frota e imprime a chave do gateway (uma vez)
+#   docker compose --profile tools run --rm load       gera carga com a chave em SENSORHUB_DEVICE_KEY
+#   docker compose down -v                        derruba e apaga volumes
+# Segredos vêm do ambiente/.env (veja .env.example); a API recusa subir em Production sem SENSORHUB_JWT_KEY.
 name: sensorhub
+
+# Ambiente comum aos hosts .NET dentro da rede do Compose (hostnames dos serviços, não localhost).
+x-app-env: &app-env
+  ASPNETCORE_ENVIRONMENT: Production
+  ConnectionStrings__Postgres: Host=timescaledb;Port=5432;Database=sensorhub;Username=sensorhub;Password=sensorhub;Maximum Pool Size=20
+  Redis__ConnectionString: redis:6379,abortConnect=false
+  Kafka__BootstrapServers: kafka:9092
+  Observability__OtlpEndpoint: http://jaeger:4317
 
 services:
   kafka:
@@ -44,7 +56,7 @@ services:
       kafka:
         condition: service_healthy
     ports:
-      - "8090:8080"
+      - "8092:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: sensorhub
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
@@ -132,6 +144,96 @@ services:
       - ./docker/observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./docker/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
+
+  # ---------------------------------------------------------------- aplicação (Fase 9, perfil "apps")
+  api:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: docker/dotnet.Dockerfile
+      args: { PROJECT: src/SensorHub.Api, ENTRY: SensorHub.Api.dll }
+    image: sensorhub-api:local
+    restart: unless-stopped
+    depends_on:
+      kafka: { condition: service_healthy }
+      timescaledb: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    # A API NÃO publica porta: só o nginx do dashboard a alcança. Por isso é seguro confiar no X-Forwarded-For dele.
+    expose: ["8080"]
+    environment:
+      <<: *app-env
+      Security__JwtSigningKey: ${SENSORHUB_JWT_KEY:-}
+      Security__BootstrapAdmin__Email: ${SENSORHUB_ADMIN_EMAIL:-}
+      Security__BootstrapAdmin__Password: ${SENSORHUB_ADMIN_PASSWORD:-}
+      Security__TrustForwardedHeaders: "true"
+      Security__RateLimits__IngestionPerSecond: ${SENSORHUB_INGEST_RATE:-2000}
+      Security__RateLimits__IngestionBurst: ${SENSORHUB_INGEST_BURST:-4000}
+    healthcheck:
+      # a imagem do runtime não tem curl/wget: um GET cru via /dev/tcp do bash
+      test:
+        - CMD
+        - bash   # /dev/tcp é recurso do bash; o CMD-SHELL usaria o sh (dash), que não o tem
+        - -c
+        # bloco literal ("|"): as barras invertidas do printf chegam ao shell sem serem reinterpretadas pelo YAML
+        - |
+          exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /health/live HTTP/1.0\r\n\r\n' >&3 && head -1 <&3 | grep -q 200
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  worker:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: docker/dotnet.Dockerfile
+      args: { PROJECT: src/SensorHub.Worker, ENTRY: SensorHub.Worker.dll }
+    image: sensorhub-worker:local
+    restart: unless-stopped
+    # Escalável: cada réplica entra nos consumer groups e o Kafka reparte as partições entre elas (demonstração de rebalance).
+    deploy:
+      replicas: 2
+    depends_on:
+      api: { condition: service_healthy }   # a API aplica as migrações; o Worker sobe depois
+    environment:
+      <<: *app-env
+      ASPNETCORE_URLS: http://+:9464
+
+  dashboard:
+    profiles: ["apps"]
+    build:
+      context: .
+      dockerfile: docker/dashboard/Dockerfile
+    image: sensorhub-dashboard:local
+    restart: unless-stopped
+    depends_on:
+      api: { condition: service_healthy }
+    ports:
+      - "8081:80"
+
+  # ---------------------------------------------------------------- ferramentas (perfil "tools")
+  register:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: docker/dotnet.Dockerfile
+      args: { PROJECT: tools/SensorHub.Simulator, ENTRY: SensorHub.Simulator.dll }
+    image: sensorhub-simulator:local
+    depends_on:
+      api: { condition: service_healthy }
+    environment:
+      SENSORHUB_ADMIN_PASSWORD: ${SENSORHUB_ADMIN_PASSWORD:-}
+    command: ["--mode", "register", "--url", "http://api:8080", "--sensors", "${SENSORS:-300}", "--rules", "threshold,nodata",
+              "--admin-email", "${SENSORHUB_ADMIN_EMAIL:-}"]
+
+  load:
+    profiles: ["tools"]
+    image: sensorhub-simulator:local
+    depends_on:
+      api: { condition: service_healthy }
+    command: ["--mode", "http", "--url", "http://api:8080", "--sensors", "${SENSORS:-300}", "--rate", "${RATE:-3000}",
+              "--duration", "${DURATION:-60}", "--batch", "${BATCH:-100}", "--workers", "${WORKERS:-4}", "--hot", "${HOT:-1}",
+              "--api-key", "${SENSORHUB_DEVICE_KEY:-}"]
 
 volumes:
   kafka-data:

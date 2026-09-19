@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+**/node_modules/
+web/dashboard/dist/
+.git/
+.vs/
+.env
+*.key
+tests/
+docs/
