@@ -10,6 +10,7 @@
     <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.12" />
     <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.12" />
     <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" Version="10.10.0" />
+    <PackageReference Include="MQTTnet" Version="5.2.0.1603" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="Testcontainers.Kafka" Version="4.15.0" />
     <PackageReference Include="Testcontainers.PostgreSql" Version="4.15.0" />
@@ -24,6 +25,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\SensorHub.Api\SensorHub.Api.csproj" />
+    <ProjectReference Include="..\..\src\SensorHub.MqttBridge\SensorHub.MqttBridge.csproj" />
     <ProjectReference Include="..\..\src\SensorHub.Infrastructure\SensorHub.Infrastructure.csproj" />
     <ProjectReference Include="..\..\src\SensorHub.Application\SensorHub.Application.csproj" />
   </ItemGroup>
