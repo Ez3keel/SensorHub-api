@@ -3,6 +3,8 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SensorHub.Application.Contracts;
 using SensorHub.Application.Ingestion;
+using SensorHub.Application.Observability;
+using System.Diagnostics;
 
 namespace SensorHub.Infrastructure.Kafka;
 
@@ -52,30 +54,43 @@ public sealed class KafkaReadingPublisher : IReadingPublisher, IDisposable
 
     public async Task PublishAsync(IReadOnlyList<ReadingMessage> messages, CancellationToken cancellationToken)
     {
+        // Um span por lote publicado (não por mensagem). Seu contexto viaja nos headers de TODAS as mensagens do lote: é o elo
+        // que liga a requisição HTTP ao consumer do outro lado da fila.
+        using var activity = SensorHubTelemetry.Source.StartActivity("sensorhub.readings publish", ActivityKind.Producer);
+        activity?.SetTag("messaging.system", "kafka");
+        activity?.SetTag("messaging.destination.name", _topic);
+        activity?.SetTag("messaging.batch.message_count", messages.Count);
+        var clock = Stopwatch.StartNew();
+
         var deliveries = new List<Task<DeliveryResult<string, byte[]>>>(messages.Count);
 
         try
         {
             foreach (var message in messages)
             {
+                var headers = new Headers { { "schema-version", [(byte)message.SchemaVersion] } };
+                KafkaTraceContext.Inject(headers, activity);
                 deliveries.Add(_producer.ProduceAsync(_topic, new Message<string, byte[]>
                 {
                     Key = message.SensorId.ToString("D"),
                     Value = ReadingMessageSerializer.Serialize(message),
                     Timestamp = new Timestamp(message.Timestamp),
-                    Headers = new Headers { { "schema-version", [(byte)message.SchemaVersion] } }
+                    Headers = headers
                 }, cancellationToken));
             }
 
             await Task.WhenAll(deliveries);
+            SensorHubTelemetry.PublishDuration.Record(clock.Elapsed.TotalMilliseconds);
         }
         catch (ProduceException<string, byte[]> ex) when (ex.Error.Code == ErrorCode.Local_QueueFull)
         {
+            activity?.SetStatus(ActivityStatusCode.Error, "fila local cheia");
             // Fila local cheia: o broker não está escoando tão rápido quanto chegamos. Backpressure.
             throw new IngestionUnavailableException("Fila de publicação cheia; tente novamente em instantes.", ex);
         }
         catch (Exception ex) when (ex is KafkaException or ProduceException<string, byte[]>)
         {
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
             throw new IngestionUnavailableException("Não foi possível confirmar a publicação no Kafka.", ex);
         }
         catch (AggregateException ex)

@@ -1,7 +1,9 @@
+using System.Diagnostics;
 using Confluent.Kafka;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Options;
 using SensorHub.Application.Alerting;
+using SensorHub.Application.Observability;
 using SensorHub.Application.Processing;
 using SensorHub.Application.Realtime;
 using SensorHub.Infrastructure.Kafka;
@@ -112,7 +114,10 @@ public sealed class RealtimeFlushService(
         }
 
         foreach (var (group, list) in byGroup)
+        {
             await hub.Clients.Group(TelemetryHub.ReadingGroup(group)).SendAsync("readings", list, cancellationToken);
+            SensorHubTelemetry.RealtimePushes.Add(1, new KeyValuePair<string, object?>("kind", "readings"));
+        }
 
         // 2) detalhe: só para sensores que alguém, em qualquer instância, está assistindo
         var subscribed = await GetSubscribedSensorsAsync(cancellationToken);
@@ -121,6 +126,8 @@ public sealed class RealtimeFlushService(
         foreach (var reading in readings.Where(r => subscribed.Contains(r.SensorId)))
             await hub.Clients.Group(TelemetryHub.SensorGroup(reading.SensorId))
                 .SendAsync("reading", new ReadingPush(reading.SensorId, reading.Timestamp, reading.Value), cancellationToken);
+
+        SensorHubTelemetry.RealtimePushes.Add(readings.Count(r => subscribed.Contains(r.SensorId)), new KeyValuePair<string, object?>("kind", "reading"));
     }
 
     /// <summary>Lista de sensores assistidos, cacheada por 1 s: consultar o Redis a cada flush de 250 ms seria desperdício.</summary>
@@ -184,12 +191,17 @@ public sealed class AlertEventListener(
                 var alertEvent = AlertEventSerializer.Deserialize(result.Message.Value);
                 if (alertEvent is null || !_seen.TryAdd(alertEvent)) continue; // ilegível ou duplicata (at-least-once do motor)
 
+                using var activity = SensorHubTelemetry.Source.StartActivity(
+                    "sensorhub.alerts process", ActivityKind.Consumer, KafkaTraceContext.Extract(result.Message.Headers) ?? default);
+                activity?.SetTag("alert.kind", alertEvent.Kind.ToString());
+
                 var push = new AlertPush(alertEvent.AlertId, alertEvent.RuleId, alertEvent.SensorId, alertEvent.Kind.ToString(),
                     alertEvent.Severity.ToString(), alertEvent.At, alertEvent.Value, alertEvent.Message);
                 try
                 {
                     await hub.Clients.Group(TelemetryHub.AlertsGroup).SendAsync("alert", push, ct);
                     await hub.Clients.Group(TelemetryHub.SensorGroup(alertEvent.SensorId)).SendAsync("alert", push, ct);
+                    SensorHubTelemetry.RealtimePushes.Add(1, new KeyValuePair<string, object?>("kind", "alert"));
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested)
                 {

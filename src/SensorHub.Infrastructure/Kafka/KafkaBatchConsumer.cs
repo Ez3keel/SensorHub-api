@@ -3,6 +3,7 @@ using Confluent.Kafka;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using SensorHub.Application.Contracts;
+using SensorHub.Application.Observability;
 using SensorHub.Application.Processing;
 using SensorHub.Domain.Common;
 
@@ -39,6 +40,8 @@ public sealed class KafkaBatchConsumer : BackgroundService
     private readonly List<ConsumeResult<string, byte[]>> _carryOver = [];
 
     private long _consumed, _batches, _deadLettered, _transientRetries, _bisections;
+    private readonly string _ownerId = Guid.NewGuid().ToString("N");
+    private readonly KeyValuePair<string, object?> _groupTag;
     private int _assignedPartitions;
 
     public KafkaBatchConsumer(
@@ -58,6 +61,7 @@ public sealed class KafkaBatchConsumer : BackgroundService
         _logger = logger;
         _isPoison = isPoison ?? (_ => false);
         _topic = options.Topic ?? kafka.ReadingsTopic;
+        _groupTag = new KeyValuePair<string, object?>("group", options.GroupId);
     }
 
     public string Name => _name;
@@ -99,6 +103,7 @@ public sealed class KafkaBatchConsumer : BackgroundService
         }
         finally
         {
+            ConsumerLagRegistry.Remove(_ownerId); // o gauge de lag não deve congelar o último valor de um consumer que saiu
             try { consumer.Close(); } // sai do grupo de forma limpa: evita esperar session.timeout para rebalancear
             catch (Exception ex) { _logger.LogWarning(ex, "[{Name}] erro ao fechar consumer.", _name); }
         }
@@ -167,6 +172,10 @@ public sealed class KafkaBatchConsumer : BackgroundService
 
     private async Task ProcessAsync(IConsumer<string, byte[]> consumer, List<ConsumeResult<string, byte[]>> batch, CancellationToken ct)
     {
+        // Um lote mistura mensagens de VÁRIAS requisições (traces diferentes). Convenção do OpenTelemetry para consumo em lote:
+        // o span do lote continua o trace da primeira mensagem e tem LINKS para os das demais.
+        using var activity = StartBatchActivity(batch);
+
         var valid = new List<(ConsumeResult<string, byte[]> Source, ConsumedReading Reading)>(batch.Count);
 
         foreach (var message in batch)
@@ -174,16 +183,50 @@ public sealed class KafkaBatchConsumer : BackgroundService
             if (TryParse(message, out var reading, out var error))
                 valid.Add((message, reading));
             else
-                await SendToDeadLetterAsync(message, error, ct);
+                await SendToDeadLetterAsync(message, error, "parse", ct);
         }
 
         if (valid.Count > 0)
+        {
+            var clock = Stopwatch.StartNew();
             await HandleWithRetryAsync(consumer, valid, ct);
+            SensorHubTelemetry.HandlerDuration.Record(clock.Elapsed.TotalMilliseconds, _groupTag);
+
+            // Latência ponta a ponta: da ingestão pela API (dado mais novo do lote) até este lote estar tratado.
+            var newestIngest = valid.Max(v => v.Reading.IngestedAt);
+            SensorHubTelemetry.ProcessingDelay.Record(Math.Max(0, (DateTimeOffset.UtcNow - newestIngest).TotalSeconds), _groupTag);
+        }
 
         Commit(consumer, batch);
 
         Interlocked.Add(ref _consumed, batch.Count);
         Interlocked.Increment(ref _batches);
+        SensorHubTelemetry.ConsumerMessages.Add(batch.Count, _groupTag);
+        SensorHubTelemetry.ConsumerBatches.Add(1, _groupTag);
+        SensorHubTelemetry.ConsumerBatchSize.Record(batch.Count, _groupTag);
+    }
+
+    private Activity? StartBatchActivity(List<ConsumeResult<string, byte[]>> batch)
+    {
+        var contexts = batch
+            .Select(m => KafkaTraceContext.Extract(m.Message.Headers))
+            .Where(c => c is not null)
+            .Select(c => c!.Value)
+            .DistinctBy(c => c.TraceId)
+            .Take(11) // limita os links: um lote pode misturar milhares de requisições
+            .ToList();
+
+        var links = contexts.Skip(1).Select(c => new ActivityLink(c)).ToList();
+        var tags = new KeyValuePair<string, object?>[]
+        {
+            new("messaging.system", "kafka"),
+            new("messaging.destination.name", _topic),
+            new("messaging.kafka.consumer.group", _options.GroupId),
+            new("messaging.batch.message_count", batch.Count)
+        };
+
+        return SensorHubTelemetry.Source.StartActivity(
+            $"{_topic} process", ActivityKind.Consumer, contexts.Count > 0 ? contexts[0] : default, tags, links);
     }
 
     private static bool TryParse(ConsumeResult<string, byte[]> message, out ConsumedReading reading, out string error)
@@ -243,6 +286,7 @@ public sealed class KafkaBatchConsumer : BackgroundService
                 catch (Exception ex) when (!ct.IsCancellationRequested)
                 {
                     Interlocked.Increment(ref _transientRetries);
+                    SensorHubTelemetry.ConsumerRetries.Add(1, _groupTag);
                     _logger.LogWarning(ex, "[{Name}] falha transitória ao processar lote de {Count}; nova tentativa em {Delay}ms (offsets NÃO commitados).",
                         _name, items.Count, delay);
 
@@ -289,7 +333,7 @@ public sealed class KafkaBatchConsumer : BackgroundService
     {
         if (items.Count == 1)
         {
-            await SendToDeadLetterAsync(items[0].Source, $"Falha permanente no handler: {cause.Message}", ct);
+            await SendToDeadLetterAsync(items[0].Source, $"Falha permanente no handler: {cause.Message}", "handler", ct);
             return;
         }
 
@@ -302,7 +346,7 @@ public sealed class KafkaBatchConsumer : BackgroundService
         }
     }
 
-    private async Task SendToDeadLetterAsync(ConsumeResult<string, byte[]> source, string reason, CancellationToken ct)
+    private async Task SendToDeadLetterAsync(ConsumeResult<string, byte[]> source, string reason, string kind, CancellationToken ct)
     {
         _logger.LogError("[{Name}] mensagem para DLQ ({Topic}[{Partition}]@{Offset}): {Reason}",
             _name, source.Topic, source.Partition.Value, source.Offset.Value, reason);
@@ -312,6 +356,7 @@ public sealed class KafkaBatchConsumer : BackgroundService
             source.Topic, source.Partition.Value, source.Offset.Value, _options.GroupId), ct);
 
         Interlocked.Increment(ref _deadLettered);
+        SensorHubTelemetry.DeadLetters.Add(1, _groupTag, new KeyValuePair<string, object?>("reason", kind));
     }
 
     // ------------------------------------------------------------------ commit
@@ -354,7 +399,9 @@ public sealed class KafkaBatchConsumer : BackgroundService
             // o modo "eager" (padrão) pararia o grupo inteiro a cada entrada/saída.
             PartitionAssignmentStrategy = PartitionAssignmentStrategy.CooperativeSticky,
             MaxPollIntervalMs = _options.MaxPollIntervalMs,
-            SessionTimeoutMs = 30_000
+            SessionTimeoutMs = 30_000,
+            // O librdkafka reporta o lag por partição neste intervalo; alimenta o gauge sensorhub.consumer.lag.
+            StatisticsIntervalMs = _options.StatisticsIntervalMs
         };
 
         return new ConsumerBuilder<string, byte[]>(config)
@@ -364,12 +411,14 @@ public sealed class KafkaBatchConsumer : BackgroundService
                 // depois da reatribuição são legítimas, e descartá-las e commitar adiante perderia dados.
                 foreach (var p in partitions) _revoked.Remove(p);
                 Interlocked.Add(ref _assignedPartitions, partitions.Count);
+                SensorHubTelemetry.Rebalances.Add(1, _groupTag, new KeyValuePair<string, object?>("kind", "assigned"));
                 _logger.LogInformation("[{Name}] partições atribuídas: {Partitions}", _name, string.Join(",", partitions.Select(p => p.Partition.Value)));
             })
             .SetPartitionsRevokedHandler((_, partitions) =>
             {
                 foreach (var p in partitions) _revoked.Add(p.TopicPartition);
                 Interlocked.Add(ref _assignedPartitions, -partitions.Count);
+                SensorHubTelemetry.Rebalances.Add(1, _groupTag, new KeyValuePair<string, object?>("kind", "revoked"));
                 _logger.LogInformation("[{Name}] partições revogadas: {Partitions}", _name, string.Join(",", partitions.Select(p => p.Partition.Value)));
             })
             .SetPartitionsLostHandler((_, partitions) =>
@@ -377,6 +426,11 @@ public sealed class KafkaBatchConsumer : BackgroundService
                 foreach (var p in partitions) _revoked.Add(p.TopicPartition);
                 Interlocked.Add(ref _assignedPartitions, -partitions.Count);
                 _logger.LogWarning("[{Name}] partições PERDIDAS: {Partitions}", _name, string.Join(",", partitions.Select(p => p.Partition.Value)));
+            })
+            .SetStatisticsHandler((_, json) =>
+            {
+                try { ConsumerLagRegistry.Update(_ownerId, _options.GroupId, KafkaStatistics.ParseLag(json)); }
+                catch (Exception ex) { _logger.LogDebug(ex, "[{Name}] estatísticas ilegíveis.", _name); }
             })
             .SetErrorHandler((_, e) => _logger.LogWarning("[{Name}] kafka: {Reason}", _name, e.Reason))
             .Build();

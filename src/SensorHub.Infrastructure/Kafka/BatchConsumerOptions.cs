@@ -24,6 +24,9 @@ public sealed class BatchConsumerOptions
     public int InitialRetryDelayMs { get; set; } = 200;
     public int MaxRetryDelayMs { get; set; } = 10_000;
 
+    /// <summary>Intervalo do relatório de estatísticas do librdkafka (de onde sai o lag por partição).</summary>
+    public int StatisticsIntervalMs { get; set; } = 5_000;
+
     /// <summary>Tempo máximo entre polls. Se um lote demorar mais que isso o broker expulsa o consumer do grupo.</summary>
     public int MaxPollIntervalMs { get; set; } = 300_000;
 }

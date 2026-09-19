@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using SensorHub.Application.Observability;
 using SensorHub.Application.Processing;
 using SensorHub.Domain.Alerts;
 using SensorHub.Domain.Readings;
@@ -139,6 +140,7 @@ public sealed class AlertEngine(
                 }
 
                 toPublish.Add(ToEvent(alert.Id, rule, AlertEventKind.Fired, evaluation, alert.Message));
+                CountTransition("fired", rule);
             }
             else
             {
@@ -146,6 +148,7 @@ public sealed class AlertEngine(
                 if (resolved is null) continue;
 
                 toPublish.Add(ToEvent(resolved.Id, rule, AlertEventKind.Resolved, evaluation, resolved.Message));
+                CountTransition("resolved", rule);
             }
         }
 
@@ -156,6 +159,12 @@ public sealed class AlertEngine(
                 toPublish.Count, toPublish.Count(e => e.Kind == AlertEventKind.Fired), toPublish.Count(e => e.Kind == AlertEventKind.Resolved));
         }
     }
+
+    private static void CountTransition(string kind, AlertRule rule) =>
+        SensorHubTelemetry.AlertTransitions.Add(1,
+            new KeyValuePair<string, object?>("kind", kind),
+            new KeyValuePair<string, object?>("severity", rule.Severity.ToString()),
+            new KeyValuePair<string, object?>("rule_type", rule.Type.ToString()));
 
     private static AlertEvent ToEvent(Guid alertId, AlertRule rule, AlertEventKind kind, RuleEvaluation evaluation, string message) =>
         new(AlertEvent.CurrentSchemaVersion, alertId, rule.Id, rule.SensorId, kind, rule.Severity, evaluation.At, evaluation.Value, message);

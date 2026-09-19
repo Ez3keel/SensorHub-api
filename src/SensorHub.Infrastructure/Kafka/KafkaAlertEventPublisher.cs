@@ -2,6 +2,8 @@ using System.Text;
 using Confluent.Kafka;
 using Microsoft.Extensions.Options;
 using SensorHub.Application.Alerting;
+using SensorHub.Application.Observability;
+using System.Diagnostics;
 
 namespace SensorHub.Infrastructure.Kafka;
 
@@ -32,13 +34,22 @@ public sealed class KafkaAlertEventPublisher : IAlertEventPublisher, IDisposable
 
     public async Task PublishAsync(IReadOnlyList<AlertEvent> events, CancellationToken cancellationToken)
     {
-        var deliveries = events.Select(e => _producer.ProduceAsync(_topic, new Message<string, byte[]>
+        using var activity = SensorHubTelemetry.Source.StartActivity("sensorhub.alerts publish", ActivityKind.Producer);
+        activity?.SetTag("messaging.system", "kafka");
+        activity?.SetTag("messaging.destination.name", _topic);
+
+        var deliveries = events.Select(e =>
         {
-            Key = e.SensorId.ToString("D"),
-            Value = AlertEventSerializer.Serialize(e),
-            Timestamp = new Timestamp(e.At),
-            Headers = new Headers { { "event-kind", Encoding.UTF8.GetBytes(e.Kind.ToString()) } }
-        }, cancellationToken)).ToList();
+            var headers = new Headers { { "event-kind", Encoding.UTF8.GetBytes(e.Kind.ToString()) } };
+            KafkaTraceContext.Inject(headers, activity); // o trace segue: leitura -> alerta -> dashboard
+            return _producer.ProduceAsync(_topic, new Message<string, byte[]>
+            {
+                Key = e.SensorId.ToString("D"),
+                Value = AlertEventSerializer.Serialize(e),
+                Timestamp = new Timestamp(e.At),
+                Headers = headers
+            }, cancellationToken);
+        }).ToList();
 
         await Task.WhenAll(deliveries);
     }

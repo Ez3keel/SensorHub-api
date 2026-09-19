@@ -1,5 +1,6 @@
 using FluentValidation;
 using SensorHub.Application.Contracts;
+using SensorHub.Application.Observability;
 using SensorHub.Domain.Common;
 using SensorHub.Domain.Readings;
 
@@ -45,6 +46,10 @@ public sealed class IngestionService(
 
         if (accepted.Count > 0)
             await publisher.PublishAsync(accepted, cancellationToken);
+
+        SensorHubTelemetry.IngestedReadings.Add(accepted.Count, new KeyValuePair<string, object?>("result", "accepted"));
+        if (rejected.Count > 0)
+            SensorHubTelemetry.IngestedReadings.Add(rejected.Count, new KeyValuePair<string, object?>("result", "rejected"));
 
         return new IngestionResult(accepted.Count, rejected);
     }

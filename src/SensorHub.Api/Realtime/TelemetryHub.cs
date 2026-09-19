@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Options;
+using SensorHub.Application.Observability;
 using SensorHub.Application.Realtime;
 
 namespace SensorHub.Api.Realtime;
@@ -86,8 +87,15 @@ public sealed class TelemetryHub(ISubscriptionRegistry registry, IOptions<Realti
 
     public Task UnsubscribeAlerts() => Groups.RemoveFromGroupAsync(Context.ConnectionId, AlertsGroup);
 
+    public override Task OnConnectedAsync()
+    {
+        SensorHubTelemetry.RealtimeConnections.Add(1);
+        return base.OnConnectedAsync();
+    }
+
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
+        SensorHubTelemetry.RealtimeConnections.Add(-1);
         // O SignalR já remove a conexão dos grupos; o que ele NÃO sabe é a contagem de assinantes no registro do cluster.
         foreach (var sensor in Track<Guid>(SensorsKey).ToList())
             await registry.RemoveAsync(sensor, CancellationToken.None);
