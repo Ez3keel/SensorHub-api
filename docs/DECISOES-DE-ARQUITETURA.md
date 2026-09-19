@@ -1088,3 +1088,80 @@ Isolado ele já passava (3 de 3 antes da correção, então o sintoma só aparec
 
 **6. Ruído `libgssapi_krb5.so.2: cannot open shared object file` no log dos containers.** O librdkafka tenta carregar a biblioteca Kerberos (GSSAPI) ao iniciar; a imagem `aspnet` não a traz e o cluster usa PLAINTEXT. Inofensivo (a conexão e o consumo funcionam);
 só seria necessário com SASL/GSSAPI.
+
+
+## Fase 10: MQTT (Mosquitto → bridge → Kafka)
+
+Dispositivos IoT reais raramente falam HTTP: usam MQTT (protocolo leve, sessão persistente, QoS, funciona em redes ruins). A fase põe um **Mosquitto** na frente e um **bridge** que entrega
+as mensagens ao MESMO caminho de ingestão da API HTTP (validação, posse do sensor, idempotência, Kafka). O broker não substitui o Kafka: é a borda para dispositivos, e o Kafka segue sendo o log durável.
+
+### D10.1: Um caminho só de ingestão (o bridge reusa o `IngestionService`)
+O bridge é um consumidor MQTT que chama o mesmo `IngestionService` da API. Regra de negócio duplicada seria o primeiro lugar a divergir (um limite de faixa que muda de um lado e não do outro),
+e a mesma chave de partição (`sensorId`) mantém a ordem por sensor idêntica nos dois protocolos. O teste de integração confere a chave da mensagem no Kafka.
+
+### D10.2: Autenticação: a MESMA chave de API, validada pelo broker via plugin HTTP
+Usuário MQTT = id do dispositivo, senha = chave de API (`shk_...`). O Mosquitto roda com `mosquitto-go-auth` e **não guarda credenciais**: a cada CONNECT ele pergunta a um serviço nosso (`/mqtt/auth`),
+que usa o `IDeviceAuthenticator` da Fase 8. Assim criar, rotacionar e desativar a chave na API de administração vale para HTTP e MQTT, sem um arquivo de senhas paralelo. A chave precisa ser DESTA identidade
+(uma chave válida de outro dispositivo não autentica como você). O bridge se autentica como um superusuário próprio (`sensorhub-bridge`, segredo forte exigido na subida, comparação em tempo constante).
+
+### D10.3: ACL: dispositivo só PUBLICA no próprio tópico e não lê nada
+`sensorhub/devices/{deviceId}/readings`, somente escrita, somente o próprio id. Não pode assinar (nem `#`, nem o próprio tópico, nem `$share`), então nunca enxerga dados alheios. Isso é o que torna o **id do tópico confiável**: o bridge deriva a
+identidade do tópico, nunca do conteúdo. A ACL também consulta o banco: desativar um dispositivo corta quem JÁ está conectado (o broker só autentica no CONNECT), com o atraso do cache curto do plugin (30 s em produção).
+Limite honesto: **rotacionar a chave não derruba uma sessão já aberta**, só impede a próxima conexão; para expulsar na hora, desative o dispositivo.
+
+### D10.4: Autenticação e consumidor são PROCESSOS SEPARADOS (papéis `auth` e `bridge`)
+Achado por um teste que falhou (ver bug 1): quando o backend de autenticação vivia no mesmo processo do consumidor, parar o bridge fazia o broker falhar TODA checagem de ACL e desconectava todos os dispositivos. O mesmo binário roda
+em dois papéis (como o Worker): `auth` (sem Kafka, só Postgres) e `bridge` (consumidor). Um deploy do bridge não toca a conexão dos dispositivos.
+
+### D10.5: At-least-once de ponta a ponta: PUBACK manual, QoS 1, sessão persistente, assinatura compartilhada
+- O bridge assina `$share/sensorhub-bridge/sensorhub/devices/+/readings` com QoS 1 e **sessão persistente**; o PUBACK só sai DEPOIS que o Kafka confirmou (`AutoAcknowledge = false`).
+  Se o bridge cai no meio, o broker reentrega e a persistência idempotente por `(sensor_id, ts)` absorve a duplicata.
+- Assinatura compartilhada (`$share`): réplicas do bridge dividem a carga (cada mensagem vai a UMA delas) em vez de cada uma receber tudo.
+- Falha do Kafka: até N tentativas com backoff; esgotadas, NÃO confirma e derruba a conexão, o que antecipa a reentrega. Mensagem **malformada** (JSON inválido, lote vazio, tópico fora do esquema, payload grande) é confirmada e descartada com log e
+  métrica: reentregá-la travaria para sempre a fila do dispositivo (poison message). Rejeições de negócio (sensor alheio, valor absurdo) também são confirmadas: reenviar não muda o veredito.
+
+### D10.6: Contrapressão sem fila em memória
+O tratamento é concorrente (`Mqtt:MaxConcurrency`, 64), limitado por um semáforo adquirido NO handler: sem vaga, o cliente para de ler do socket e o `max_inflight_messages` do broker segura o resto. Ver bug 2 (por que a concorrência existe).
+
+### D10.7: Client id estável
+A sessão persistente (e as mensagens que o broker guardou) pertencem ao `clientId`. Ver bug 3. É configurável (`Mqtt:ClientId`); com várias réplicas, cada uma precisa do seu id FIXO (ordinal de StatefulSet).
+
+### D10.8: Broker e Compose
+`mosquitto` (porta 1884 no host), `mqtt-auth` e `mqtt-bridge` no perfil `apps`; sessões persistidas em volume; limites (`message_size_limit`, `max_queued_messages`, `max_inflight_messages`). O simulador ganhou `--mode mqtt`
+(usuário = id do gateway, senha = chave, QoS 1, um array JSON por mensagem). Os testes usam o MESMO `mosquitto.conf` do Compose (só trocam host/porta e o cache).
+
+### Resultados medidos (Compose completo, 1 bridge, 300 sensores, mensagens pequenas de ~3 leituras)
+| Cenário | Enviadas | Linhas novas no banco | Observação |
+|---|---|---|---|
+| 10.000/s por 30 s via MQTT | 299.987 | **299.987** | lag final 0 |
+| 30.000/s por 30 s via MQTT | 899.938 | **899.938** | publicação bridge→Kafka p95 25 ms, atraso de persistência p95 0,42 s |
+| 10.000/s por 45 s, **`kill -9` do bridge** (10 s fora) | 449.969 | **449.969** | o broker guardou as mensagens e as entregou ao bridge que voltou |
+| 8.000/s por 40 s, **container do bridge recriado** | 319.994 | **319.994** | mesmo `clientId`, sessão preservada |
+
+Testes: 19 de integração contra Mosquitto real (autenticação, ACL, posse, veneno, rotação, desativação, queda do bridge, 400 mensagens pequenas), mais 30+ unitários das regras puras (tópicos, payload, política de acesso, destino de cada mensagem).
+
+### Bugs encontrados
+
+**1. Publicar com o bridge fora do ar DESCONECTAVA o dispositivo (teste de integração reprovou: `Unexpected DISCONNECT`).** *Causa raiz:* o backend de autenticação/ACL do Mosquitto estava no mesmo processo do bridge; sem ele, o plugin não consegue
+validar a ACL e o broker derruba o publicador. *Correção:* papéis separados (D10.4). A mesma classe de erro (acoplar o caminho de autorização ao de processamento) apareceria em qualquer deploy.
+
+**2. Vazão de ~250 leituras/s com mensagens pequenas (achado na prova de carga, não nos testes).** O simulador enviava 300 mil leituras em ~93 mil mensagens de ~3 leituras; o bridge as tratava UMA POR VEZ (~31 ms cada, dos quais ~9 ms de Kafka), logo ~31 msg/s.
+A vazão de um consumidor serial é 1/latência, não a capacidade da máquina. *Correção:* tratamento concorrente limitado (D10.6). Depois: 30.000 leituras/s pelo mesmo caminho, sem perda. Lição: testes funcionais não mostram isso; só a carga com o formato REAL de mensagem (pequenas e muitas).
+
+**3. ~148 mil leituras "sumiram" após um redeploy do bridge (achado na mesma carga).** O `clientId` era derivado do hostname do container, que muda a cada recriação. As mensagens que o broker guardara para a sessão persistente ficaram presas na sessão do id antigo
+e o container novo (id novo) nunca as recebeu. *Correção:* `ClientId` estável e configurável, com teste de propriedade; depois, recriar o container no meio da carga não perdeu nada (319.994 = 319.994). Nota: o dado só estava "preso", mas expiraria com a sessão (1 h): em produção equivaleria a perda.
+
+**4. Todas as 300 mil publicações falharam com "Falhas: 299.980" e nenhum motivo.** Duas causas encadeadas: (a) `mosquitto.conf` apontava a autenticação para `mqtt-bridge`, e o serviço de autenticação se chama `mqtt-auth` (erro de nome ao separar os papéis; o broker recusava até o próprio bridge);
+(b) o simulador só contava falhas. O relatório agora traz a **primeira falha** (`Primeira falha: ...`), com teste. O bridge, entretanto, se comportou como projetado: ficou tentando reconectar a cada 2 s e conectou sozinho depois da correção.
+
+**5. O cliente MQTTnet 5 não lança exceção quando o broker recusa o CONNECT** (devolve um `ResultCode`), ao contrário do que meus testes assumiam (`ThrowsAny` falhava com "nenhuma exceção"). Achei, pelos logs do broker, que ele recusava corretamente ("not authorised"), então o defeito era só do teste. O helper passou a
+lançar `MqttRefusedException` (e o próprio bridge e o simulador já checavam o `ResultCode`). Isso importa em produção: código que ignora o `ResultCode` acharia que está conectado.
+
+**6. Colisão do tipo `Program` (`CS0433`) de novo.** Com dois projetos web referenciados pelos testes. Ponto de entrada explícito (`BridgeEntryPoint.Main`) em vez de instruções de nível superior, e o host fica em `MqttBridgeHost.Build` (usado também pelos testes, com Kestrel real).
+
+**7. Prometheus não enxergava os alvos novos.** O arquivo montado mudou, mas o processo não recarrega sozinho. Reinício do container; um `--web.enable-lifecycle` + reload seria a evolução.
+
+### Limitações conhecidas (não implementadas)
+- Os endpoints `/mqtt/*` do serviço de autenticação só são protegidos pelo isolamento de rede (o plugin não envia cabeçalho de segredo); sem TLS entre broker e dispositivos neste ambiente local. Em produção: TLS no listener do broker e rede privada para o auth.
+- Sem mensagens de comando para os dispositivos (o dispositivo não pode assinar nada): o sentido broker→dispositivo fica para depois.
+- Mensagens descartadas por malformação não vão a uma DLQ MQTT; ficam em métrica (`outcome=malformed`) e log.

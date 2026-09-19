@@ -1,6 +1,7 @@
 #!/bin/bash
 # Demo de resiliência (Git Bash/Linux): kill -9 de um worker no meio da carga e volta da réplica; confere zero perda e zero duplicata.
 # Uso: KILL=1 RATE=10000 DURATION=45 ./scripts/resilience-demo.sh   (HOT=100 KILL=0 para o teste de chave quente)
+# MQTT: SERVICE=load-mqtt VICTIM=sensorhub-mqtt-bridge-1 ./scripts/resilience-demo.sh
 # Requer a stack de pé (docker compose --profile apps up -d), o dispositivo registrado e SENSORHUB_DEVICE_KEY no .env.
 cd "$(dirname "$0")/.."
 export MSYS_NO_PATHCONV=1
@@ -18,16 +19,16 @@ BEFORE=$(count)
 echo "linhas antes: $BEFORE"
 partitions > /tmp/offs_before.txt
 
-RATE=${RATE:-10000} DURATION=${DURATION:-45} BATCH=500 WORKERS=8 HOT=${HOT:-1} docker compose --profile apps --profile tools run --rm load > /tmp/load.out 2>&1 &
+RATE=${RATE:-10000} DURATION=${DURATION:-45} BATCH=500 WORKERS=8 HOT=${HOT:-1} docker compose --profile apps --profile tools run --rm ${SERVICE:-load} > /tmp/load.out 2>&1 &
 LOADPID=$!
 
 if [ "${KILL:-1}" = "1" ]; then
   sleep 12
-  echo "$(date +%T) kill -9 worker-2"
-  docker kill sensorhub-worker-2 > /dev/null
+  echo "$(date +%T) kill -9 ${VICTIM:-sensorhub-worker-2}"
+  docker kill ${VICTIM:-sensorhub-worker-2} > /dev/null
   sleep 10
   echo "$(date +%T) sobe a réplica de novo"
-  docker start sensorhub-worker-2 > /dev/null
+  docker start ${VICTIM:-sensorhub-worker-2} > /dev/null
 fi
 
 wait $LOADPID

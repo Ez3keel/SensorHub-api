@@ -37,7 +37,7 @@ Três *consumer groups* independentes leem o mesmo tópico: é o que o Kafka faz
 | 7 | Observabilidade (OpenTelemetry, lag do consumer) | ✅ |
 | 8 | Segurança (JWT, chaves de API por dispositivo, rate limit) e administração | ✅ |
 | 9 | Compose completo + prova de carga | ✅ |
-| 10 | MQTT (bridge → Kafka) | ⏳ |
+| 10 | MQTT (Mosquitto → bridge → Kafka) | ✅ |
 
 ## Executando localmente
 
@@ -72,6 +72,18 @@ RATE=20000 DURATION=60 BATCH=500 WORKERS=8 docker compose --profile apps --profi
 
 Medido nesta stack (1 broker, 2 Workers, 20.000 leituras/s por 60 s): 1.199.986 enviadas, 1.199.986 gravadas, lag 0, publicação p95 32 ms,
 atraso de processamento p95 entre 95 e 475 ms. Com `kill -9` de um Worker no meio da carga, nada se perde nem se duplica. Números e limitações em `docs/DECISOES-DE-ARQUITETURA.md` (Fase 9).
+
+## MQTT
+
+Dispositivos também podem publicar por MQTT (Mosquitto, porta `1884` no host). Usuário = id do dispositivo, senha = a MESMA chave de API da ingestão HTTP; cada dispositivo só publica em
+`sensorhub/devices/{deviceId}/readings` (payload: um objeto `{sensorId, timestamp?, value, unit?}` ou um array deles) e não lê nada. QoS 1, sessão persistente e PUBACK só depois do Kafka: at-least-once de ponta a ponta.
+
+```bash
+docker compose --profile tools run --rm load-mqtt     # mesma carga, como dispositivo MQTT
+SERVICE=load-mqtt VICTIM=sensorhub-mqtt-bridge-1 ./scripts/resilience-demo.sh   # kill -9 do bridge no meio da carga
+```
+
+Medido: 30.000 leituras/s por MQTT (mensagens de ~3 leituras), 899.938 enviadas = 899.938 gravadas; `kill -9` e recriação do bridge sob carga sem perda. Detalhes e bugs: "Fase 10" em `docs/DECISOES-DE-ARQUITETURA.md`.
 
 ## Segurança
 
