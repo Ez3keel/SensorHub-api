@@ -4,6 +4,7 @@
     <Project Path="src/SensorHub.Application/SensorHub.Application.csproj" />
     <Project Path="src/SensorHub.Domain/SensorHub.Domain.csproj" />
     <Project Path="src/SensorHub.Infrastructure/SensorHub.Infrastructure.csproj" />
+    <Project Path="src/SensorHub.MqttBridge/SensorHub.MqttBridge.csproj" />
     <Project Path="src/SensorHub.Worker/SensorHub.Worker.csproj" />
   </Folder>
   <Folder Name="/tests/">
