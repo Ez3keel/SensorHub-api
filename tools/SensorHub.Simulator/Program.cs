@@ -42,8 +42,17 @@ if (settings.Mode == "register")
     var rules = settings.Rules.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
         .Select(r => r.ToLowerInvariant()).ToHashSet();
     AdminCredentials? admin = settings.AdminEmail.Length > 0 ? new(settings.AdminEmail, settings.AdminPassword) : null;
-    var registration = await new FleetRegistrar(httpClient, admin).RegisterAsync(
-        fleet, rules.Contains("threshold"), rules.Contains("nodata"), settings.NoDataSeconds, cancellationToken: cts.Token);
+    RegistrationReport registration;
+    try
+    {
+        registration = await new FleetRegistrar(httpClient, admin).RegisterAsync(
+            fleet, rules.Contains("threshold"), rules.Contains("nodata"), settings.NoDataSeconds, cancellationToken: cts.Token);
+    }
+    catch (HttpRequestException ex)
+    {
+        Console.Error.WriteLine($"Cadastro interrompido: {ex.Message}");
+        return 1;
+    }
     Console.WriteLine($"Cadastro: {registration.DevicesCreated} dispositivo(s) criado(s), {registration.SensorsCreated} sensores criados, " +
                       $"{registration.SensorsAlreadyExisted} já existiam, {registration.RulesCreated} regras criadas, {registration.Failures} falhas.");
     foreach (var (deviceId, key) in registration.ApiKeys ?? new Dictionary<Guid, string>())

@@ -43,7 +43,7 @@ public sealed class FleetRegistrar(HttpClient http, AdminCredentials? admin = nu
         await Parallel.ForEachAsync(fleet.Sensors, new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = cancellationToken },
             async (sensor, ct) =>
             {
-                var response = await http.PostAsJsonAsync("api/sensors", new
+                var response = await PostAsync("api/sensors", new
                 {
                     id = sensor.Id, deviceId = sensor.DeviceId, name = sensor.Name,
                     metric = sensor.Metric.ToString(), unit = sensor.Unit, group = sensor.Group
@@ -65,9 +65,23 @@ public sealed class FleetRegistrar(HttpClient http, AdminCredentials? admin = nu
         return new RegistrationReport(created, existed, rules, failures, devicesCreated, devicesExisted, keys);
     }
 
+    /// <summary>POST que respeita o limite da API: em 429 espera o <c>Retry-After</c> (ou 1 s) e repete, em vez de contar falha.</summary>
+    private async Task<HttpResponseMessage> PostAsync(string url, object body, CancellationToken ct)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            var response = await http.PostAsJsonAsync(url, body, ct);
+            if (response.StatusCode != HttpStatusCode.TooManyRequests || attempt >= 30) return response;
+
+            var wait = response.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(1);
+            response.Dispose();
+            await Task.Delay(wait > TimeSpan.Zero ? wait : TimeSpan.FromSeconds(1), ct);
+        }
+    }
+
     private async Task LoginAsync(AdminCredentials credentials, CancellationToken ct)
     {
-        var response = await http.PostAsJsonAsync("api/auth/login", new { email = credentials.Email, password = credentials.Password }, ct);
+        var response = await PostAsync("api/auth/login", new { email = credentials.Email, password = credentials.Password }, ct);
         if (!response.IsSuccessStatusCode)
             throw new HttpRequestException($"Login de administrador falhou ({(int)response.StatusCode}).", null, response.StatusCode);
 
@@ -83,7 +97,7 @@ public sealed class FleetRegistrar(HttpClient http, AdminCredentials? admin = nu
 
         foreach (var deviceId in fleet.Sensors.Select(s => s.DeviceId).Distinct())
         {
-            var response = await http.PostAsJsonAsync("api/devices", new { id = deviceId, name = $"sim-{deviceId.ToString("N")[..8]}" }, ct);
+            var response = await PostAsync("api/devices", new { id = deviceId, name = $"sim-{deviceId.ToString("N")[..8]}" }, ct);
             if (response.StatusCode == HttpStatusCode.Created)
             {
                 created++;
@@ -109,7 +123,7 @@ public sealed class FleetRegistrar(HttpClient http, AdminCredentials? admin = nu
 
     private async Task<bool> PostRuleAsync(Guid sensorId, string name, string type, string comparison, double threshold, int durationSeconds, CancellationToken ct)
     {
-        var response = await http.PostAsJsonAsync("api/alert-rules", new
+        var response = await PostAsync("api/alert-rules", new
         {
             sensorId, name, type, comparison, threshold, durationSeconds, hysteresis = 0, severity = type == "NoData" ? "Warning" : "Critical"
         }, ct);

@@ -75,6 +75,22 @@ public class FleetRegistrarTests
     }
 
     [Fact]
+    public async Task A_429_is_waited_out_and_retried_instead_of_counted_as_a_failure()
+    {
+        var sensorCalls = 0;
+        var handler = new Stub(url =>
+            url.EndsWith("api/sensors") && Interlocked.Increment(ref sensorCalls) == 1 ? HttpStatusCode.TooManyRequests : HttpStatusCode.Created,
+            retryAfterSeconds: 0);
+
+        var report = await new FleetRegistrar(new HttpClient(handler) { BaseAddress = new Uri("http://api/") })
+            .RegisterAsync(new SensorFleet(1), false, false, 20, parallelism: 1);
+
+        Assert.Equal(1, report.SensorsCreated);
+        Assert.Equal(0, report.Failures);
+        Assert.Equal(2, handler.Bodies.Count(b => b.Url.EndsWith("api/sensors"))); // a primeira foi repetida
+    }
+
+    [Fact]
     public async Task An_existing_device_is_not_an_error_but_has_no_recoverable_key()
     {
         var handler = new Stub(url => url.EndsWith("api/devices") ? HttpStatusCode.Conflict : HttpStatusCode.Created);
@@ -87,7 +103,7 @@ public class FleetRegistrarTests
         Assert.Equal(0, report.Failures);
     }
 
-    private sealed class Stub(Func<string, HttpStatusCode> respond, Func<string, string>? bodyFor = null) : HttpMessageHandler
+    private sealed class Stub(Func<string, HttpStatusCode> respond, Func<string, string>? bodyFor = null, int? retryAfterSeconds = null) : HttpMessageHandler
     {
         private readonly List<(string Url, string Body)> _bodies = [];
         private readonly List<string> _auth = [];
@@ -99,7 +115,10 @@ public class FleetRegistrarTests
             var url = request.RequestUri!.ToString();
             var body = request.Content is null ? "" : await request.Content.ReadAsStringAsync(cancellationToken);
             lock (_bodies) { _bodies.Add((url, body)); _auth.Add(request.Headers.Authorization?.ToString() ?? ""); }
-            return new HttpResponseMessage(respond(url)) { Content = new StringContent(bodyFor?.Invoke(url) ?? "{}") };
+            var response = new HttpResponseMessage(respond(url)) { Content = new StringContent(bodyFor?.Invoke(url) ?? "{}") };
+            if (response.StatusCode == HttpStatusCode.TooManyRequests && retryAfterSeconds is { } seconds)
+                response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(seconds));
+            return response;
         }
     }
 }
