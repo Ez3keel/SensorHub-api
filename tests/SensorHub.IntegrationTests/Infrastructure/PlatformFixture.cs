@@ -123,6 +123,7 @@ public sealed class ApiFactory(string bootstrapServers, Dictionary<string, strin
                 // O banco de teste já é migrado pela fixture; a API não precisa (nem deve) migrar de novo.
                 ["Persistence:MigrateOnStartup"] = "false",
                 ["Redis:KeyPrefix"] = "test:",
+                ["Realtime:Enabled"] = "false",
                 ["Redis:ConnectionString"] = redisConnection ?? "localhost:1,abortConnect=false,connectTimeout=500",
                 ["ConnectionStrings:Postgres"] = postgresConnection ?? "Host=localhost;Port=1;Database=none;Username=none;Password=none;Timeout=2"
             };
