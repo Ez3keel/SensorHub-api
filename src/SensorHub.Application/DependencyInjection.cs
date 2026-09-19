@@ -3,6 +3,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using SensorHub.Application.Ingestion;
 using SensorHub.Application.Management;
+using SensorHub.Application.Security;
 using SensorHub.Application.Queries;
 
 namespace SensorHub.Application;
@@ -24,6 +25,15 @@ public static class DependencyInjection
         services.AddScoped<SensorService>();
         services.AddScoped<AlertRuleService>();
         services.AddScoped<AlertService>();
+        return services;
+    }
+
+    public static IServiceCollection AddSecurityServices(this IServiceCollection services)
+    {
+        services.AddSingleton(TimeProvider.System);
+        services.AddScoped<AuthService>();
+        services.AddScoped<UserService>();
+        services.AddScoped<DeviceService>();
         return services;
     }
 

@@ -36,7 +36,7 @@ public interface IAlertRepository
     Task<IReadOnlyList<Alert>> ListAsync(AlertStatus? status, Guid? sensorId, int skip, int take, CancellationToken cancellationToken);
 }
 
-public sealed class SensorService(ISensorRepository sensors, IUnitOfWork unitOfWork, TimeProvider clock)
+public sealed class SensorService(ISensorRepository sensors, Security.IDeviceRepository devices, IUnitOfWork unitOfWork, TimeProvider clock)
 {
     public const int MaxPageSize = 500;
 
@@ -46,7 +46,9 @@ public sealed class SensorService(ISensorRepository sensors, IUnitOfWork unitOfW
         if (id is { } wanted && wanted != Guid.Empty && await sensors.GetAsync(wanted, cancellationToken) is not null)
             throw new ConflictException($"Já existe um sensor com o id '{wanted}'.");
 
+        // Valida a forma (400) antes de consultar a existência do dispositivo (404).
         var sensor = Sensor.Create(deviceId, name, metric, unit, group, clock.GetUtcNow(), id);
+        _ = await devices.GetAsync(deviceId, cancellationToken) ?? throw new NotFoundException("Dispositivo", deviceId);
         await sensors.AddAsync(sensor, cancellationToken);
         await unitOfWork.SaveChangesAsync(cancellationToken);
         return sensor;
